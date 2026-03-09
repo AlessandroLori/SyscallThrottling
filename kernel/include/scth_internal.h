@@ -8,6 +8,7 @@
 #include <linux/hashtable.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/list.h>
 
 #include "scth_ioctl.h"
 
@@ -43,13 +44,17 @@ struct scth_cfg_store {
     __u32 sys_count;
 };
 
-/* Stato globale */
-struct scth_state {
-    spinlock_t lock;          /* per timer+variabili epoch/max/policy/stats */
-    atomic_t epoch_tokens;   /* slot/gettoni rimasti nella epoca corrente */
-    bool monitor_on;
+struct scth_waiter {
+    struct list_head node;
+    wait_queue_head_t wq;
+    bool granted;
+    bool aborted;
+    u64 ticket;
+};
 
-    __u32 epoch_used;
+struct scth_state {
+    spinlock_t lock;
+    bool monitor_on;
 
     __u32 max_active;
     __u32 max_pending;
@@ -58,8 +63,17 @@ struct scth_state {
     __u8 policy_pending;
 
     __u64 epoch_id;
-    
-    /* stats (M2: ancora get/reset, update arriverà con throttling) */
+
+    /* budget di epoca corrente */
+    __u32 epoch_used;
+
+    /* WAKE_RACE: token rimasti in epoca corrente */
+    atomic_t epoch_tokens;
+
+    /* waitqueue per cambio epoca (WAKE_RACE) */
+    wait_queue_head_t epoch_wq;
+
+    /* stats */
     __u64 peak_delay_ns;
     char  peak_comm[SCTH_COMM_LEN];
     __u32 peak_euid;
@@ -69,15 +83,17 @@ struct scth_state {
     __u64 blocked_num_samples;
     __u32 current_blocked_threads;
 
-    wait_queue_head_t epoch_wq;
-
     struct timer_list epoch_timer;
 
-    unsigned long sys_call_table_addr; /* da USCTM via script (M3) */
+    unsigned long sys_call_table_addr;
 
-    /* nuovo: configurazione sets, protetta da mutex */
     struct mutex cfg_mutex;
     struct scth_cfg_store cfg;
+
+    /* FIFO_STRICT queue globale */
+    struct list_head fifo_q;
+    __u32 fifo_qlen;
+    atomic64_t fifo_seq;
 };
 
 extern struct scth_state g_scth;
@@ -93,7 +109,7 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg);
 int  scth_monitor_on(void);
 int  scth_monitor_off(void);
 
-/* cfg API (M2) */
+/* cfg API */
 void scth_cfg_init(struct scth_cfg_store *c);
 void scth_cfg_destroy(struct scth_cfg_store *c);
 
@@ -115,6 +131,7 @@ bool scth_cfg_has_sys(struct scth_cfg_store *c, __u32 nr);
 __u32 scth_cfg_sys_count(struct scth_cfg_store *c);
 __u32 scth_cfg_fill_sys_list(struct scth_cfg_store *c, __u32 *out, __u32 cap);
 
+/* hook API */
 int  scth_hook_install(__u32 nr);
 int  scth_hook_remove(__u32 nr);
 void scth_hook_remove_all(void);
