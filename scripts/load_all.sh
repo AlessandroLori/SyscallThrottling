@@ -36,8 +36,16 @@ echo "[+] sys_call_table_address(dec)=$SYS_ADDR hex=$HEX_ADDR"
 
 echo "[*] Reload scthrottle with sys_call_table_addr..."
 if lsmod | grep -q '^scthrottle\b'; then
-  sudo rmmod scthrottle
+  sudo pkill -9 scthctl 2>/dev/null || true
+  sudo fuser -k /dev/scthrottle 2>/dev/null || true
+
+  if ! sudo rmmod scthrottle; then
+    echo "[-] Cannot rmmod scthrottle (still in use). Aborting."
+    sudo fuser -v /dev/scthrottle || true
+    exit 1
+  fi
 fi
+
 sudo insmod "$KMOD_DIR/scthrottle.ko" sys_call_table_addr="$SYS_ADDR"
 
 echo "[*] Done. Loaded modules:"

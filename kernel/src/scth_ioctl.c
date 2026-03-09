@@ -329,7 +329,7 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
 
     case SCTH_IOC_ADD_SYS: {
         struct scth_sys_arg a;
-        int ret;
+        int ret, hret;
 
         if (!scth_is_root())
             return -EPERM;
@@ -337,14 +337,30 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
             return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
+
+        /* 1) aggiorna bitmap */
         ret = scth_cfg_add_sys(&g_scth.cfg, a.nr);
+        if (ret != 0) {
+            mutex_unlock(&g_scth.cfg_mutex);
+            return ret;
+        }
+
+        /* 2) installa hook */
+        hret = scth_hook_install(a.nr);
+        if (hret != 0 && hret != -EALREADY) {
+            /* rollback bitmap */
+            scth_cfg_del_sys(&g_scth.cfg, a.nr);
+            mutex_unlock(&g_scth.cfg_mutex);
+            return hret;
+        }
+
         mutex_unlock(&g_scth.cfg_mutex);
-        return ret;
+        return 0;
     }
 
     case SCTH_IOC_DEL_SYS: {
         struct scth_sys_arg a;
-        int ret;
+        int ret, hret;
 
         if (!scth_is_root())
             return -EPERM;
@@ -352,6 +368,21 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
             return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
+
+        /* se non registrata -> ENOENT */
+        if (!scth_cfg_has_sys(&g_scth.cfg, a.nr)) {
+            mutex_unlock(&g_scth.cfg_mutex);
+            return -ENOENT;
+        }
+
+        /* 1) rimuovi hook (prima) */
+        hret = scth_hook_remove(a.nr);
+        if (hret != 0 && hret != -ENOENT) {
+            mutex_unlock(&g_scth.cfg_mutex);
+            return hret;
+        }
+
+        /* 2) aggiorna bitmap */
         ret = scth_cfg_del_sys(&g_scth.cfg, a.nr);
         mutex_unlock(&g_scth.cfg_mutex);
         return ret;

@@ -107,3 +107,7 @@ int  scth_cfg_del_sys(struct scth_cfg_store *c, __u32 nr);
 bool scth_cfg_has_sys(struct scth_cfg_store *c, __u32 nr);
 __u32 scth_cfg_sys_count(struct scth_cfg_store *c);
 __u32 scth_cfg_fill_sys_list(struct scth_cfg_store *c, __u32 *out, __u32 cap);
+
+int  scth_hook_install(__u32 nr);
+int  scth_hook_remove(__u32 nr);
+void scth_hook_remove_all(void);

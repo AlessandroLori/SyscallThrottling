@@ -123,6 +123,8 @@ static void __exit scth_exit(void)
     mutex_lock(&g_scth.cfg_mutex);
     scth_cfg_destroy(&g_scth.cfg);
     mutex_unlock(&g_scth.cfg_mutex);
+    /* Restore syscall table entries (M3) */
+    scth_hook_remove_all();
     scth_dev_exit();
     pr_info("scthrottle: unloaded\n");
 }
