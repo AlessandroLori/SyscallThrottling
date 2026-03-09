@@ -3,21 +3,21 @@
 #include <linux/printk.h>
 #include <linux/ptrace.h>
 #include <linux/preempt.h>
-#include <linux/irqflags.h>
-#include <linux/sched.h>
 #include <linux/cred.h>
 #include <linux/uidgid.h>
 #include <linux/wait.h>
-#include <linux/string.h>
+#include <linux/ktime.h>
+#include <linux/irqflags.h>
+#include <linux/sched.h>
+#include <linux/user_namespace.h>
 
 #include <asm/processor-flags.h>
 #include <asm/special_insns.h>
+#include <asm/paravirt.h>
 
 #include "scth_internal.h"
 
 typedef asmlinkage long (*scth_sys_fn_t)(const struct pt_regs *regs);
-
-static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs);
 
 static scth_sys_fn_t *scth_syscall_table(void)
 {
@@ -36,7 +36,6 @@ struct scth_wp_ctx {
     unsigned long irqflags;
 };
 
-/* Forced CR writes: bypass native_write_cr0() checks */
 static __always_inline void write_cr0_forced(unsigned long val)
 {
     unsigned long __force_order;
@@ -55,13 +54,14 @@ static __always_inline void scth_wp_off(struct scth_wp_ctx *ctx)
     local_irq_save(ctx->irqflags);
 
     ctx->cr0 = read_cr0();
-    ctx->cr4 = __read_cr4();
+    ctx->cr4 = native_read_cr4();
 
 #ifdef X86_CR4_CET
     if (ctx->cr4 & X86_CR4_CET)
         write_cr4_forced(ctx->cr4 & ~X86_CR4_CET);
 #endif
 
+    /* force WP=0 without native_write_cr0 checks */
     write_cr0_forced(ctx->cr0 & ~X86_CR0_WP);
 }
 
@@ -84,8 +84,6 @@ static __always_inline void scth_blocked_inc(void)
     unsigned long flags;
     spin_lock_irqsave(&g_scth.lock, flags);
     g_scth.current_blocked_threads++;
-    if (g_scth.current_blocked_threads > g_scth.peak_blocked_threads)
-        g_scth.peak_blocked_threads = g_scth.current_blocked_threads;
     spin_unlock_irqrestore(&g_scth.lock, flags);
 }
 
@@ -98,40 +96,28 @@ static __always_inline void scth_blocked_dec(void)
     spin_unlock_irqrestore(&g_scth.lock, flags);
 }
 
-/* ---- FILTER: prog OR uid (usa funzioni che esistono: has_*) ---- */
+/* ---- cfg match: (prog OR uid) ---- */
 static bool scth_match_prog_or_uid(const char comm[SCTH_COMM_LEN], u32 euid)
 {
-    bool match_prog, match_uid;
+    bool match;
 
     mutex_lock(&g_scth.cfg_mutex);
-    match_prog = scth_cfg_has_prog(&g_scth.cfg, comm);
-    match_uid  = scth_cfg_has_uid(&g_scth.cfg, euid);
+    match = scth_cfg_has_prog(&g_scth.cfg, comm) || scth_cfg_has_uid(&g_scth.cfg, euid);
     mutex_unlock(&g_scth.cfg_mutex);
 
-    return match_prog || match_uid;
+    return match;
 }
 
-/* ---- M3: wait until next epoch ---- */
-static __always_inline int scth_wait_next_epoch(u64 epoch0)
-{
-    long ret = wait_event_interruptible(
-        g_scth.epoch_wq,
-        READ_ONCE(g_scth.epoch_id) != epoch0 || !READ_ONCE(g_scth.monitor_on)
-    );
-
-    if (ret < 0)
-        return -EINTR;
-
-    return 0;
-}
-
-/* wrapper M3 */
+/* ---- wrapper M3: max_active slot per epoca, gli altri aspettano epoca successiva ---- */
 static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 {
     u32 nr = (u32)regs->orig_ax;
     scth_sys_fn_t orig;
     char comm[SCTH_COMM_LEN];
     u32 euid;
+
+    bool waited = false;
+    u64 t0_ns = 0;
 
     if (nr >= NR_syscalls)
         return -ENOSYS;
@@ -140,30 +126,69 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
     if (!orig)
         return -ENOSYS;
 
-    /* monitor off => bypass immediato */
+    /* monitor off => pass-through */
     if (!READ_ONCE(g_scth.monitor_on))
         return orig(regs);
 
     get_task_comm(comm, current);
     euid = (u32)from_kuid(&init_user_ns, current_euid());
 
-    /* se NON matcha (prog OR uid) => nessun delay */
+    /* se NON matcha (prog OR uid), non throttliamo */
     if (!scth_match_prog_or_uid(comm, euid))
         return orig(regs);
 
-    /* delay fino alla prossima epoca */
-    {
-        u64 e0 = READ_ONCE(g_scth.epoch_id);
+    /* prova a prendere uno slot; se non c'è, aspetta fino a epoca successiva e riprova */
+    for (;;) {
+        unsigned long flags;
+        u64 e0;
+        bool allowed = false;
+
+        spin_lock_irqsave(&g_scth.lock, flags);
+
+        if (!g_scth.monitor_on) {
+            spin_unlock_irqrestore(&g_scth.lock, flags);
+            return orig(regs);
+        }
+
+        e0 = g_scth.epoch_id;
+
+        if (g_scth.epoch_used < g_scth.max_active) {
+            g_scth.epoch_used++;
+            allowed = true;
+        }
+
+        spin_unlock_irqrestore(&g_scth.lock, flags);
+
+        if (allowed)
+            break;
+
+        /* prima volta che blocchi: start timer delay */
+        if (!waited) {
+            waited = true;
+            t0_ns = ktime_get_ns();
+        }
 
         scth_blocked_inc();
-        if (scth_wait_next_epoch(e0) != 0) {
+
+        if (wait_event_interruptible(
+                g_scth.epoch_wq,
+                READ_ONCE(g_scth.epoch_id) != e0 || !READ_ONCE(g_scth.monitor_on)
+            ) < 0) {
             scth_blocked_dec();
             return -EINTR;
         }
+
         scth_blocked_dec();
 
-        pr_info_ratelimited("scthrottle: delayed nr=%u comm=%s euid=%u\n",
-                            nr, comm, euid);
+        /* se hanno spento il monitor mentre aspettavi: bypass immediato */
+        if (!READ_ONCE(g_scth.monitor_on))
+            return orig(regs);
+    }
+
+    if (waited) {
+        u64 delay_ns = ktime_get_ns() - t0_ns;
+        pr_info_ratelimited("scthrottle: delayed nr=%u comm=%s euid=%u delay_ns=%llu\n",
+                            nr, comm, euid, (unsigned long long)delay_ns);
     }
 
     return orig(regs);

@@ -7,6 +7,7 @@
 #include <linux/mutex.h>
 #include <linux/hashtable.h>
 #include <linux/wait.h>
+#include <linux/atomic.h>
 
 #include "scth_ioctl.h"
 
@@ -45,7 +46,10 @@ struct scth_cfg_store {
 /* Stato globale */
 struct scth_state {
     spinlock_t lock;          /* per timer+variabili epoch/max/policy/stats */
+    atomic_t epoch_tokens;   /* slot/gettoni rimasti nella epoca corrente */
     bool monitor_on;
+
+    __u32 epoch_used;
 
     __u32 max_active;
     __u32 max_pending;
