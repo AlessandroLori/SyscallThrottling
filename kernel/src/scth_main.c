@@ -5,6 +5,7 @@
 #include <linux/string.h>
 #include <linux/moduleparam.h>
 #include <linux/timer.h>
+#include <linux/wait.h>
 
 #include "scth_internal.h"
 
@@ -18,6 +19,9 @@ MODULE_PARM_DESC(sys_call_table_addr, "Address of sys_call_table (from USCTM), e
 static void scth_epoch_timer_fn(struct timer_list *t)
 {
     unsigned long flags;
+    bool do_wake = false;
+
+    (void)t;
 
     spin_lock_irqsave(&g_scth.lock, flags);
 
@@ -28,12 +32,13 @@ static void scth_epoch_timer_fn(struct timer_list *t)
 
     /* Nuova epoca */
     g_scth.epoch_id++;
+    do_wake = true;
 
     /* Applica pending -> active (last write wins) */
     g_scth.max_active = g_scth.max_pending;
     g_scth.policy_active = g_scth.policy_pending;
 
-    /* Campionamento blocked (in M1 rimarrà 0) */
+    /* Campionamento blocked (in M1 rimarrà 0, in M3 può crescere) */
     g_scth.blocked_sum_samples += g_scth.current_blocked_threads;
     g_scth.blocked_num_samples++;
 
@@ -41,6 +46,10 @@ static void scth_epoch_timer_fn(struct timer_list *t)
     mod_timer(&g_scth.epoch_timer, jiffies + HZ);
 
     spin_unlock_irqrestore(&g_scth.lock, flags);
+
+    /* Sveglia i thread bloccati nel wrapper (delay fino a prossima epoca) */
+    if (do_wake)
+        wake_up_all(&g_scth.epoch_wq);
 }
 
 int scth_monitor_on(void)
@@ -71,11 +80,16 @@ int scth_monitor_off(void)
     unsigned long flags;
     bool was_on;
 
+    /* Spegni monitor sotto lock */
     spin_lock_irqsave(&g_scth.lock, flags);
     was_on = g_scth.monitor_on;
     g_scth.monitor_on = false;
     spin_unlock_irqrestore(&g_scth.lock, flags);
 
+    /* Sveglia subito eventuali thread in wait_event_interruptible() */
+    wake_up_all(&g_scth.epoch_wq);
+
+    /* Ferma il timer (se era attivo) */
     if (was_on)
         timer_delete_sync(&g_scth.epoch_timer);
 
@@ -89,6 +103,10 @@ static int __init scth_init(void)
     memset(&g_scth, 0, sizeof(g_scth));
     spin_lock_init(&g_scth.lock);
     mutex_init(&g_scth.cfg_mutex);
+
+    /* M3: waitqueue per delay fino a prossima epoca */
+    init_waitqueue_head(&g_scth.epoch_wq);
+
     scth_cfg_init(&g_scth.cfg);
 
     /* default ragionevoli */
@@ -100,7 +118,7 @@ static int __init scth_init(void)
 
     timer_setup(&g_scth.epoch_timer, scth_epoch_timer_fn, 0);
 
-    /* bootstrap sys_call_table_addr (M1: non lo usiamo ancora, ma lo memorizziamo) */
+    /* bootstrap sys_call_table_addr (M3: serve per hook) */
     g_scth.sys_call_table_addr = sys_call_table_addr;
     if (g_scth.sys_call_table_addr)
         pr_info("scthrottle: sys_call_table_addr=0x%lx (from USCTM)\n", g_scth.sys_call_table_addr);
@@ -120,11 +138,14 @@ static int __init scth_init(void)
 static void __exit scth_exit(void)
 {
     scth_monitor_off();
+
     mutex_lock(&g_scth.cfg_mutex);
     scth_cfg_destroy(&g_scth.cfg);
     mutex_unlock(&g_scth.cfg_mutex);
+
     /* Restore syscall table entries (M3) */
     scth_hook_remove_all();
+
     scth_dev_exit();
     pr_info("scthrottle: unloaded\n");
 }
@@ -134,4 +155,4 @@ module_exit(scth_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("syscall_throttle project");
-MODULE_DESCRIPTION("Syscall throttling module (M1: ioctl + tick, USCTM sys_call_table bootstrap)");
+MODULE_DESCRIPTION("Syscall throttling module (M3: hook + delay until next epoch)");

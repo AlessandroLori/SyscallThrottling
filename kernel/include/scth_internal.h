@@ -6,6 +6,7 @@
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/hashtable.h>
+#include <linux/wait.h>
 
 #include "scth_ioctl.h"
 
@@ -53,7 +54,7 @@ struct scth_state {
     __u8 policy_pending;
 
     __u64 epoch_id;
-
+    
     /* stats (M2: ancora get/reset, update arriverà con throttling) */
     __u64 peak_delay_ns;
     char  peak_comm[SCTH_COMM_LEN];
@@ -63,6 +64,8 @@ struct scth_state {
     __u64 blocked_sum_samples;
     __u64 blocked_num_samples;
     __u32 current_blocked_threads;
+
+    wait_queue_head_t epoch_wq;
 
     struct timer_list epoch_timer;
 
