@@ -11,7 +11,40 @@
 
 #include "scth_internal.h"
 
+#ifndef SCTH_LOG_GRANT
+#define SCTH_LOG_GRANT(...) do { } while (0)
+#endif
+
 struct scth_state g_scth;
+
+/*
+
+python3 - <<'PY'
+import time, subprocess
+N = 20
+DUR = 10
+print(f"[PRESSURE TEST] N={N} processes per burst, duration={DUR}s")
+t_end = time.time() + DUR
+while time.time() < t_end:
+    ps=[subprocess.Popen(["uname"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(N)]
+    for p in ps: p.wait()
+print("done")
+PY
+sudo ./scthctl off
+sudo ./scthctl resetstats
+sudo ./scthctl setmax 3
+sudo ./scthctl setpolicy 1
+sudo ./scthctl on
+sudo ./scthctl delsys 63 2>/dev/null || true
+sudo ./scthctl addsys 63
+sudo ./scthctl delprog uname 2>/dev/null || true
+sudo ./scthctl addprog uname
+
+*/
+
+
+
+
 
 /* Module parameter: sys_call_table address discovered by USCTM */
 static unsigned long sys_call_table_addr = 0;
@@ -167,6 +200,13 @@ static int __init scth_init(void)
     spin_lock_init(&g_scth.lock);
     mutex_init(&g_scth.cfg_mutex);
     init_waitqueue_head(&g_scth.epoch_wq);
+
+    atomic64_set(&g_scth.total_tracked, 0);
+    atomic64_set(&g_scth.total_immediate, 0);
+    atomic64_set(&g_scth.total_delayed, 0);
+    atomic64_set(&g_scth.total_aborted, 0);
+    atomic64_set(&g_scth.delay_sum_ns, 0);
+    atomic64_set(&g_scth.delay_num, 0);
 
     INIT_LIST_HEAD(&g_scth.fifo_q);
     g_scth.fifo_qlen = 0;
