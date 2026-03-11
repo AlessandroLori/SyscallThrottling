@@ -19,7 +19,6 @@
 
 #include "scth_internal.h"
 
-
 typedef asmlinkage long (*scth_sys_fn_t)(const struct pt_regs *regs);
 
 static scth_sys_fn_t *scth_syscall_table(void)
@@ -123,7 +122,9 @@ static __always_inline void scth_blocked_dec(void)
 }
 
 /* ---- peak delay helper ---- */
-static __always_inline void scth_update_peak_delay(u64 delay_ns, const char comm[SCTH_COMM_LEN], u32 euid)
+static __always_inline void scth_update_peak_delay(u64 delay_ns,
+                                                   const char comm[SCTH_COMM_LEN],
+                                                   u32 euid)
 {
     unsigned long flags;
     spin_lock_irqsave(&g_scth.lock, flags);
@@ -135,6 +136,32 @@ static __always_inline void scth_update_peak_delay(u64 delay_ns, const char comm
     }
 
     spin_unlock_irqrestore(&g_scth.lock, flags);
+}
+
+/* ---- aggregate stats helpers ---- */
+static __always_inline void scth_stat_tracked(void)
+{
+    atomic64_inc(&g_scth.total_tracked);
+}
+
+static __always_inline void scth_stat_immediate(void)
+{
+    atomic64_inc(&g_scth.total_immediate);
+}
+
+static __always_inline void scth_stat_aborted(void)
+{
+    atomic64_inc(&g_scth.total_aborted);
+}
+
+static __always_inline void scth_stat_delayed(u64 delay_ns,
+                                              const char comm[SCTH_COMM_LEN],
+                                              u32 euid)
+{
+    atomic64_inc(&g_scth.total_delayed);
+    atomic64_add(delay_ns, &g_scth.delay_sum_ns);
+    atomic64_inc(&g_scth.delay_num);
+    scth_update_peak_delay(delay_ns, comm, euid);
 }
 
 /* ---- WAKE_RACE token acquire (per-epoch) ---- */
@@ -157,7 +184,6 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 {
     u32 nr = (u32)regs->orig_ax;
     scth_sys_fn_t orig;
-
     char comm[SCTH_COMM_LEN];
     u32 euid;
     u32 policy;
@@ -179,17 +205,13 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
     if (!scth_match_prog_or_uid(comm, euid))
         return orig(regs);
 
-    /* questa syscall è “tracciata” dal throttling */
-    atomic64_inc(&g_scth.total_tracked);
-
-    /* questa syscall è “tracciata” (stats) */
-    atomic64_inc(&g_scth.total_tracked);
+    /* questa syscall è davvero tracciata dal throttling */
+    scth_stat_tracked();
 
     policy = READ_ONCE(g_scth.policy_active);
 
     /* ---------------- WAKE_RACE ---------------- */
-        if (policy == SCTH_POLICY_WAKE_RACE) {
-        unsigned long flags;
+    if (policy == SCTH_POLICY_WAKE_RACE) {
         u64 t0 = ktime_get_ns();
         u64 epoch0 = READ_ONCE(g_scth.epoch_id);
         bool blocked_counted = false;
@@ -197,19 +219,15 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 
         /* token immediato => immediate */
         if (scth_try_take_token()) {
-            atomic64_inc(&g_scth.total_immediate);
+            scth_stat_immediate();
             return orig(regs);
         }
 
-        /* devo aspettare: conta “blocked threads” */
-        spin_lock_irqsave(&g_scth.lock, flags);
-        g_scth.current_blocked_threads++;
-        if (g_scth.current_blocked_threads > g_scth.peak_blocked_threads)
-            g_scth.peak_blocked_threads = g_scth.current_blocked_threads;
-        spin_unlock_irqrestore(&g_scth.lock, flags);
+        /* devo aspettare: conta blocked */
+        scth_blocked_inc();
         blocked_counted = true;
 
-        /* ticket solo per debug/log (non serve alla policy) */
+        /* ticket solo per log/debug */
         my_ticket = (u64)atomic64_inc_return(&g_scth.fifo_seq);
 
         for (;;) {
@@ -219,27 +237,18 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
                 g_scth.epoch_wq,
                 READ_ONCE(g_scth.epoch_id) != epoch0 || !READ_ONCE(g_scth.monitor_on)
             );
+
             if (ret < 0) {
-                /* signal => aborted */
-                atomic64_inc(&g_scth.total_aborted);
-                if (blocked_counted) {
-                    spin_lock_irqsave(&g_scth.lock, flags);
-                    if (g_scth.current_blocked_threads)
-                        g_scth.current_blocked_threads--;
-                    spin_unlock_irqrestore(&g_scth.lock, flags);
-                }
+                if (blocked_counted)
+                    scth_blocked_dec();
+                scth_stat_aborted();
                 return -EINTR;
             }
 
             if (!READ_ONCE(g_scth.monitor_on)) {
-                /* monitor_off mentre aspettavo => aborted (ma eseguo comunque la syscall) */
-                atomic64_inc(&g_scth.total_aborted);
-                if (blocked_counted) {
-                    spin_lock_irqsave(&g_scth.lock, flags);
-                    if (g_scth.current_blocked_threads)
-                        g_scth.current_blocked_threads--;
-                    spin_unlock_irqrestore(&g_scth.lock, flags);
-                }
+                if (blocked_counted)
+                    scth_blocked_dec();
+                scth_stat_aborted();
                 return orig(regs);
             }
 
@@ -248,22 +257,12 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
                 break;
         }
 
-        /* ottenuto token dopo attesa */
-        if (blocked_counted) {
-            spin_lock_irqsave(&g_scth.lock, flags);
-            if (g_scth.current_blocked_threads)
-                g_scth.current_blocked_threads--;
-            spin_unlock_irqrestore(&g_scth.lock, flags);
-        }
+        if (blocked_counted)
+            scth_blocked_dec();
 
         {
             u64 delay = ktime_get_ns() - t0;
-
-            atomic64_inc(&g_scth.total_delayed);
-            atomic64_add(delay, &g_scth.delay_sum_ns);
-            atomic64_inc(&g_scth.delay_num);
-
-            scth_update_peak_delay(delay, comm, euid);
+            scth_stat_delayed(delay, comm, euid);
 
             pr_info_ratelimited("scthrottle: delayed nr=%u comm=%s euid=%u delay_ns=%llu ticket=%llu\n",
                                 nr, comm, euid,
@@ -282,7 +281,6 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
         u64 t0 = ktime_get_ns();
         struct scth_waiter w;
 
-        /* init waiter */
         INIT_LIST_HEAD(&w.node);
         init_waitqueue_head(&w.wq);
         w.granted = false;
@@ -303,21 +301,24 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
          */
         if (g_scth.fifo_qlen == 0 && g_scth.epoch_used < g_scth.max_active) {
             g_scth.epoch_used++;
-            SCTH_LOG_GRANT("IMM", g_scth.epoch_id, 0, g_scth.epoch_used, g_scth.max_active, g_scth.fifo_qlen);
+            SCTH_LOG_GRANT("IMM", g_scth.epoch_id, 0,
+                           g_scth.epoch_used, g_scth.max_active, g_scth.fifo_qlen);
             allowed_now = true;
         } else {
             w.ticket = (u64)atomic64_inc_return(&g_scth.fifo_seq);
             list_add_tail(&w.node, &g_scth.fifo_q);
             g_scth.fifo_qlen++;
+            if (g_scth.fifo_qlen > g_scth.peak_fifo_qlen)
+                g_scth.peak_fifo_qlen = g_scth.fifo_qlen;
 
-            scth_blocked_inc_locked(); /* siamo già sotto lock */
+            scth_blocked_inc_locked(); /* già sotto lock */
             allowed_now = false;
         }
 
         spin_unlock_irqrestore(&g_scth.lock, flags);
 
         if (allowed_now) {
-            atomic64_inc(&g_scth.total_immediate);
+            scth_stat_immediate();
             return orig(regs);
         }
 
@@ -327,10 +328,10 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             READ_ONCE(w.granted) || READ_ONCE(w.aborted) || !READ_ONCE(g_scth.monitor_on)
         );
 
-        /* decremento blocked counter quando esco dall'attesa (qualsiasi motivo) */
+        /* quando esco dall’attesa, non sono più blocked */
         scth_blocked_dec();
 
-        /* se segnale: rimuovi dalla coda se ancora presente e abort */
+        /* signal: se ancora in coda, rimuovi e conta aborted */
         if (ret < 0) {
             spin_lock_irqsave(&g_scth.lock, flags);
             if (!READ_ONCE(w.granted) && !READ_ONCE(w.aborted) && !list_empty(&w.node)) {
@@ -340,25 +341,20 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             }
             spin_unlock_irqrestore(&g_scth.lock, flags);
 
-            atomic64_inc(&g_scth.total_aborted);
+            scth_stat_aborted();
             return -EINTR;
         }
 
-        /* monitor off o abort -> bypass immediato (non considero delayed “vero”) */
+        /* monitor off o abort -> bypass immediato */
         if (!READ_ONCE(g_scth.monitor_on) || READ_ONCE(w.aborted)) {
-            atomic64_inc(&g_scth.total_aborted);
+            scth_stat_aborted();
             return orig(regs);
         }
 
-        /* granted */
-        atomic64_inc(&g_scth.total_delayed);
-
+        /* granted dopo attesa */
         {
             u64 delay = ktime_get_ns() - t0;
-            atomic64_add(delay, &g_scth.delay_sum_ns);
-            atomic64_inc(&g_scth.delay_num);
-
-            scth_update_peak_delay(delay, comm, euid);
+            scth_stat_delayed(delay, comm, euid);
 
             pr_info_ratelimited("scthrottle: delayed nr=%u comm=%s euid=%u delay_ns=%llu ticket=%llu\n",
                                 nr, comm, euid,
