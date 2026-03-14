@@ -54,7 +54,13 @@ static int cmd_resetstats(void) { return do_ioctl0(SCTH_IOC_RESET_STATS) ? 1 : 0
 static int cmd_setmax(int argc, char **argv)
 {
     if (argc < 3) return -2;
+
     uint32_t v = (uint32_t)strtoul(argv[2], NULL, 10);
+    if (v == 0) {
+        fprintf(stderr, "setmax: valore non valido (deve essere > 0)\n");
+        return 1;
+    }
+
     return do_ioctlw(SCTH_IOC_SET_MAX, &v) ? 1 : 0;
 }
 

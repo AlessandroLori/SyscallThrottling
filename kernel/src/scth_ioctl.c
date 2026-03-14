@@ -46,13 +46,20 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
 
     case SCTH_IOC_SET_MAX: {
         __u32 v;
-        if (!scth_is_root()) return -EPERM;
-        if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+        unsigned long flags;
 
-        /* set pending */
-        spin_lock(&g_scth.lock);
+        if (!scth_is_root())
+            return -EPERM;
+
+        if (copy_from_user(&v, (void __user *)arg, sizeof(v)))
+            return -EFAULT;
+
+        if (v == 0)
+            return -EINVAL;
+
+        spin_lock_irqsave(&g_scth.lock, flags);
         g_scth.max_pending = v;
-        spin_unlock(&g_scth.lock);
+        spin_unlock_irqrestore(&g_scth.lock, flags);
         return 0;
     }
 
