@@ -71,6 +71,18 @@ static int cmd_setpolicy(int argc, char **argv)
     return do_ioctlw(SCTH_IOC_SET_POLICY, &v) ? 1 : 0;
 }
 
+static const char *policy_name(__u32 p)
+{
+    switch (p) {
+    case SCTH_POLICY_FIFO_STRICT:
+        return "FIFO_STRICT";
+    case SCTH_POLICY_WAKE_RACE:
+        return "WAKE_RACE";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 static int cmd_status(void)
 {
     struct scth_cfg c;
@@ -95,23 +107,69 @@ static int cmd_stats(void)
 
     int fd = open_dev();
     if (fd < 0) return 1;
+
     int rc = ioctl(fd, SCTH_IOC_GET_STATS, &s);
-    if (rc < 0) { perror("ioctl"); close(fd); return 1; }
+    if (rc < 0) {
+        perror("ioctl");
+        close(fd);
+        return 1;
+    }
     close(fd);
 
     double avg_blocked = 0.0;
-    if (s.blocked_samples) avg_blocked = (double)s.blocked_sum / (double)s.blocked_samples;
+    double avg_delay = 0.0;
+
+    if (s.blocked_num_samples)
+        avg_blocked = (double)s.blocked_sum_samples /
+                      (double)s.blocked_num_samples;
+
+    if (s.delay_num)
+        avg_delay = (double)s.delay_sum_ns /
+                    (double)s.delay_num;
 
     printf("abi=%u\n", s.abi_version);
-    printf("peak_delay_ns=%" PRIu64 " peak_prog=%s peak_uid=%u\n",
-           (uint64_t)s.peak_delay_ns, s.peak_prog, (unsigned)s.peak_uid);
-    printf("peak_blocked_threads=%u avg_blocked_threads=%.3f (samples=%" PRIu64 ")\n",
-           (unsigned)s.peak_blocked_threads, avg_blocked, (uint64_t)s.blocked_samples);
 
-    if (s.delay_num) {
-        double avg_delay = (double)s.delay_sum_ns / (double)s.delay_num;
-        printf("avg_delay_ns=%.0f (n=%" PRIu64 ")\n", avg_delay, (uint64_t)s.delay_num);
-    }
+    printf("peak_delay_ns=%" PRIu64 " peak_prog=%s peak_uid=%u\n",
+           (uint64_t)s.peak_delay_ns,
+           s.peak_comm,
+           (unsigned)s.peak_euid);
+
+    printf("peak_blocked_threads=%u avg_blocked_threads=%.3f (samples=%" PRIu64 ")\n",
+           (unsigned)s.peak_blocked_threads,
+           avg_blocked,
+           (uint64_t)s.blocked_num_samples);
+
+    printf("blocked_sum_samples=%" PRIu64 " blocked_num_samples=%" PRIu64 "\n",
+           (uint64_t)s.blocked_sum_samples,
+           (uint64_t)s.blocked_num_samples);
+
+    printf("delay_sum_ns=%" PRIu64 " delay_num=%" PRIu64 " avg_delay_ns=%.0f\n",
+           (uint64_t)s.delay_sum_ns,
+           (uint64_t)s.delay_num,
+           avg_delay);
+
+    printf("total_tracked=%" PRIu64 " total_immediate=%" PRIu64
+           " total_delayed=%" PRIu64 " total_aborted=%" PRIu64 "\n",
+           (uint64_t)s.total_tracked,
+           (uint64_t)s.total_immediate,
+           (uint64_t)s.total_delayed,
+           (uint64_t)s.total_aborted);
+
+    printf("peak_fifo_qlen=%u current_fifo_qlen=%u\n",
+           (unsigned)s.peak_fifo_qlen,
+           (unsigned)s.current_fifo_qlen);
+
+    printf("epoch_id=%" PRIu64 " last_epoch_used=%u max_active=%u\n",
+           (uint64_t)s.epoch_id,
+           (unsigned)s.last_epoch_used,
+           (unsigned)s.max_active);
+
+    printf("policy_active=%u(%s) policy_pending=%u(%s)\n",
+           (unsigned)s.policy_active,
+           policy_name(s.policy_active),
+           (unsigned)s.policy_pending,
+           policy_name(s.policy_pending));
+
     return 0;
 }
 

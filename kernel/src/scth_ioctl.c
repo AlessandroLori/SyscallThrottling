@@ -25,6 +25,9 @@ static void scth_stats_reset_locked(void)
     g_scth.blocked_sum_samples = 0;
     g_scth.blocked_num_samples = 0;
 
+    /* fifo stats */
+    g_scth.peak_fifo_qlen = 0;
+
     /* totals */
     atomic64_set(&g_scth.total_tracked, 0);
     atomic64_set(&g_scth.total_immediate, 0);
@@ -85,44 +88,64 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
 
     case SCTH_IOC_GET_CFG: {
         struct scth_cfg c;
+        unsigned long flags;
 
-        spin_lock(&g_scth.lock);
-        c.abi = SCTH_ABI_VERSION;
-        c.monitor_on = g_scth.monitor_on ? 1 : 0;
-        c.epoch_id = g_scth.epoch_id;
-        c.max_active = g_scth.max_active;
-        c.max_pending = g_scth.max_pending;
-        c.policy_active = g_scth.policy_active;
+        memset(&c, 0, sizeof(c));
+
+        spin_lock_irqsave(&g_scth.lock, flags);
+        c.abi_version    = SCTH_ABI_VERSION;
+        c.monitor_on     = g_scth.monitor_on ? 1 : 0;
+        c.epoch_id       = g_scth.epoch_id;
+        c.max_active     = g_scth.max_active;
+        c.max_pending    = g_scth.max_pending;
+        c.policy_active  = g_scth.policy_active;
         c.policy_pending = g_scth.policy_pending;
-        spin_unlock(&g_scth.lock);
+        spin_unlock_irqrestore(&g_scth.lock, flags);
 
-        if (copy_to_user((void __user *)arg, &c, sizeof(c))) return -EFAULT;
+        if (copy_to_user((void __user *)arg, &c, sizeof(c)))
+            return -EFAULT;
         return 0;
     }
 
-    case SCTH_IOC_STATS: {
+    case SCTH_IOC_GET_STATS: {
         struct scth_stats s;
+        unsigned long flags;
 
-        spin_lock(&g_scth.lock);
-        s.abi = SCTH_ABI_VERSION;
+        memset(&s, 0, sizeof(s));
+        s.abi_version = SCTH_ABI_VERSION;
 
-        s.peak_delay_ns = g_scth.peak_delay_ns;
-        memcpy(s.peak_comm, g_scth.peak_comm, SCTH_COMM_LEN);
-        s.peak_euid = g_scth.peak_euid;
+        spin_lock_irqsave(&g_scth.lock, flags);
+
+        s.peak_delay_ns        = g_scth.peak_delay_ns;
+        strscpy(s.peak_comm, g_scth.peak_comm, SCTH_COMM_LEN);
+        s.peak_euid            = g_scth.peak_euid;
 
         s.peak_blocked_threads = g_scth.peak_blocked_threads;
-        s.blocked_sum_samples = g_scth.blocked_sum_samples;
-        s.blocked_num_samples = g_scth.blocked_num_samples;
-        spin_unlock(&g_scth.lock);
+        s.blocked_sum_samples  = g_scth.blocked_sum_samples;
+        s.blocked_num_samples  = g_scth.blocked_num_samples;
 
-        s.total_tracked   = atomic64_read(&g_scth.total_tracked);
-        s.total_immediate = atomic64_read(&g_scth.total_immediate);
-        s.total_delayed   = atomic64_read(&g_scth.total_delayed);
-        s.total_aborted   = atomic64_read(&g_scth.total_aborted);
-        s.delay_sum_ns    = atomic64_read(&g_scth.delay_sum_ns);
-        s.delay_num       = atomic64_read(&g_scth.delay_num);
+        s.peak_fifo_qlen       = g_scth.peak_fifo_qlen;
+        s.current_fifo_qlen    = g_scth.fifo_qlen;
 
-        if (copy_to_user((void __user *)arg, &s, sizeof(s))) return -EFAULT;
+        s.last_epoch_used      = g_scth.epoch_used;
+        s.max_active           = g_scth.max_active;
+        s.epoch_id             = g_scth.epoch_id;
+
+        s.policy_active        = g_scth.policy_active;
+        s.policy_pending       = g_scth.policy_pending;
+
+        spin_unlock_irqrestore(&g_scth.lock, flags);
+
+        s.total_tracked        = (__u64)atomic64_read(&g_scth.total_tracked);
+        s.total_immediate      = (__u64)atomic64_read(&g_scth.total_immediate);
+        s.total_delayed        = (__u64)atomic64_read(&g_scth.total_delayed);
+        s.total_aborted        = (__u64)atomic64_read(&g_scth.total_aborted);
+
+        s.delay_sum_ns         = (__u64)atomic64_read(&g_scth.delay_sum_ns);
+        s.delay_num            = (__u64)atomic64_read(&g_scth.delay_num);
+
+        if (copy_to_user((void __user *)arg, &s, sizeof(s)))
+            return -EFAULT;
         return 0;
     }
 

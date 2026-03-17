@@ -307,11 +307,12 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
         } else {
             w.ticket = (u64)atomic64_inc_return(&g_scth.fifo_seq);
             list_add_tail(&w.node, &g_scth.fifo_q);
+
             g_scth.fifo_qlen++;
             if (g_scth.fifo_qlen > g_scth.peak_fifo_qlen)
                 g_scth.peak_fifo_qlen = g_scth.fifo_qlen;
 
-            scth_blocked_inc_locked(); /* già sotto lock */
+            scth_blocked_inc_locked();
             allowed_now = false;
         }
 
