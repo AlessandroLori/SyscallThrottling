@@ -63,6 +63,9 @@ t12_root_uid_nomatch: t12_root_uid_nomatch.c $(COMMON_OBJS)
 t13_setmax_invalid: t13_setmax_invalid.c $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+bench_uname: bench_uname.c
+	$(CC) $(CFLAGS) -pthread -o $@ $<
+
 clean:
 	rm -f *.o $(TESTS)
 
