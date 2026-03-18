@@ -76,25 +76,46 @@ static void scth_epoch_timer_fn(struct timer_list *t)
     g_scth.blocked_sum_samples += g_scth.current_blocked_threads;
     g_scth.blocked_num_samples++;
 
-    if (g_scth.policy_active == SCTH_POLICY_WAKE_RACE) {
-        atomic_set(&g_scth.epoch_tokens, (int)g_scth.max_active);
-        wake_race = true;
-    } else {
-        /* FIFO_STRICT: grant SOLO i primi max_active della coda */
+/* 
+ * IMPORTANTISSIMO:
+ * se esistono waiter già accodati in fifo_q, li dreniamo SEMPRE prima,
+ * anche se policy_active è ormai WAKE_RACE.
+ *
+ * Altrimenti i waiter entrati quando la policy era FIFO restano bloccati
+ * per sempre sulla loro waitqueue privata.
+ */
+    if (!list_empty(&g_scth.fifo_q)) {
+        atomic_set(&g_scth.epoch_tokens, 0);
+
         while (g_scth.epoch_used < g_scth.max_active && !list_empty(&g_scth.fifo_q)) {
-            struct scth_waiter *w = list_first_entry(&g_scth.fifo_q, struct scth_waiter, node);
+            struct scth_waiter *w =
+                list_first_entry(&g_scth.fifo_q, struct scth_waiter, node);
+
             list_del_init(&w->node);
             if (g_scth.fifo_qlen)
                 g_scth.fifo_qlen--;
 
             w->granted = true;
-            g_scth.epoch_used++;
 
-            SCTH_LOG_GRANT("Q", g_scth.epoch_id, w->ticket, g_scth.epoch_used, g_scth.max_active, g_scth.fifo_qlen);
+            SCTH_LOG_GRANT("Q",
+                           g_scth.epoch_id,
+                           w->ticket,
+                           g_scth.epoch_used,
+                        g_scth.max_active,
+                        g_scth.fifo_qlen);
+
+            g_scth.epoch_used++;
 
             /* sveglio fuori lock */
             list_add_tail(&w->node, &to_wake);
         }
+
+    } else if (g_scth.policy_active == SCTH_POLICY_WAKE_RACE) {
+        atomic_set(&g_scth.epoch_tokens, (int)g_scth.max_active);
+        wake_race = true;
+
+    } else {
+        atomic_set(&g_scth.epoch_tokens, 0);
     }
 
     /* reschedule ~1s */
