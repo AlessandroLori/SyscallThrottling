@@ -1,9 +1,12 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Intefaccia di uso lato user per comandi di gestione modulo */
+
 int cmd_run(int argc, char **argv);
 
 static void usage(const char *p)
+// Stampa comandi disponibili quando eseguito il comando "help"
 {
     printf("Usage:\n");
     printf("  %s on | off\n", p);
@@ -18,6 +21,7 @@ static void usage(const char *p)
 }
 
 int main(int argc, char **argv)
+// Controlla gli arogmenti messi in input da terminale, praticamente punto di incresso del CLI
 {
     if (argc < 2) {
         usage(argv[0]);

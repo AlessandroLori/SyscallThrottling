@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+// verfica inverso di t11, non root ma no match su userid ovvero no throttling
+
 int main(void)
 {
     if (scth_require_root()) return 2;

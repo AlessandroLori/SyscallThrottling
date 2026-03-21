@@ -2,6 +2,8 @@
 #include <time.h>
 #include <unistd.h>
 
+// verifica funzionamento setmax cambiamento budget in modo dinamico
+
 static double monotonic_sec(void)
 {
     struct timespec ts;

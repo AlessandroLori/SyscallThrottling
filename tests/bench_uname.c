@@ -9,6 +9,8 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Benchmark di confronto prestazionale tra policy FIFO e WAKE&RACE */
+
 struct worker_arg {
     int calls;
     pthread_barrier_t *bar;

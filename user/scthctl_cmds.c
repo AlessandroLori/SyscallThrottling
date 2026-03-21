@@ -7,10 +7,13 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-
 #include "scth_ioctl.h"
 
+/* Client user-space che usa il device esposto da /dev/scthrottle.
+    Implementa comandi di: invocazione di ioctl, modifica valori modulo e stampa di statistiche */
+
 static int open_dev(void)
+// Effettua l'accesso al device, sia in lettura che in scrittura
 {
     int fd = open("/dev/" SCTH_DEV_NAME, O_RDWR);
     if (fd < 0) perror("open /dev/" SCTH_DEV_NAME);
@@ -18,6 +21,7 @@ static int open_dev(void)
 }
 
 static int do_ioctl0(unsigned long req)
+// Invia una ioctl per on/off/stats
 {
     int fd = open_dev();
     if (fd < 0) return -1;
@@ -28,6 +32,7 @@ static int do_ioctl0(unsigned long req)
 }
 
 static int do_ioctlw(unsigned long req, const void *arg)
+// Invia una ioctl con strutture o singolo valore
 {
     int fd = open_dev();
     if (fd < 0) return -1;
@@ -38,6 +43,7 @@ static int do_ioctlw(unsigned long req, const void *arg)
 }
 
 static int ioctl_get_u32(unsigned long req, uint32_t *out)
+// Recupera numero di elementi nella lista
 {
     int fd = open_dev();
     if (fd < 0) return -1;
@@ -47,11 +53,12 @@ static int ioctl_get_u32(unsigned long req, uint32_t *out)
     return rc;
 }
 
-static int cmd_on(void)         { return do_ioctl0(SCTH_IOC_ON) ? 1 : 0; }
-static int cmd_off(void)        { return do_ioctl0(SCTH_IOC_OFF) ? 1 : 0; }
-static int cmd_resetstats(void) { return do_ioctl0(SCTH_IOC_RESET_STATS) ? 1 : 0; }
+static int cmd_on(void)         { return do_ioctl0(SCTH_IOC_ON) ? 1 : 0; } // accende monitor
+static int cmd_off(void)        { return do_ioctl0(SCTH_IOC_OFF) ? 1 : 0; } // spegne monitor
+static int cmd_resetstats(void) { return do_ioctl0(SCTH_IOC_RESET_STATS) ? 1 : 0; } //reset statistiche
 
 static int cmd_setmax(int argc, char **argv)
+// setta il nuovo max valido per la prossima epoca
 {
     if (argc < 3) return -2;
 
@@ -65,6 +72,7 @@ static int cmd_setmax(int argc, char **argv)
 }
 
 static int cmd_setpolicy(int argc, char **argv)
+// setta la policy per la prossima epoca
 {
     if (argc < 3) return -2;
     __u32 v = (__u32)strtoul(argv[2], NULL, 10);
@@ -72,6 +80,7 @@ static int cmd_setpolicy(int argc, char **argv)
 }
 
 static const char *policy_name(__u32 p)
+// Helper di riconoscimento policy
 {
     switch (p) {
     case SCTH_POLICY_FIFO_STRICT:
@@ -84,6 +93,7 @@ static const char *policy_name(__u32 p)
 }
 
 static int cmd_status(void)
+// Legge configurazione corrente e la stampa
 {
     struct scth_cfg c;
     memset(&c, 0, sizeof(c));
@@ -101,6 +111,7 @@ static int cmd_status(void)
 }
 
 static int cmd_stats(void)
+// Legge statistiche raccolte fino ad ora e le stampa
 {
     struct scth_stats s;
     memset(&s, 0, sizeof(s));
@@ -175,6 +186,7 @@ static int cmd_stats(void)
 
 /* ---- prog ---- */
 static int cmd_addprog(int argc, char **argv)
+// Aggiunge program name alla configurazione
 {
     if (argc < 3) return -2;
     struct scth_prog_arg a;
@@ -184,6 +196,7 @@ static int cmd_addprog(int argc, char **argv)
 }
 
 static int cmd_delprog(int argc, char **argv)
+// Rimuove program name dalla configurazione
 {
     if (argc < 3) return -2;
     struct scth_prog_arg a;
@@ -193,6 +206,7 @@ static int cmd_delprog(int argc, char **argv)
 }
 
 static int cmd_listprog(void)
+// Recupera list dei program names nella configurazione
 {
     uint32_t cnt = 0;
     if (ioctl_get_u32(SCTH_IOC_GET_PROG_COUNT, &cnt) != 0) return 1;
@@ -225,6 +239,7 @@ static int cmd_listprog(void)
 
 /* ---- uid ---- */
 static int cmd_adduid(int argc, char **argv)
+// Aggiunge userid alla configurazione
 {
     if (argc < 3) return -2;
     struct scth_uid_arg a = { .euid = (uint32_t)strtoul(argv[2], NULL, 10) };
@@ -232,6 +247,7 @@ static int cmd_adduid(int argc, char **argv)
 }
 
 static int cmd_deluid(int argc, char **argv)
+// Rimuove userid dalla configuraizone
 {
     if (argc < 3) return -2;
     struct scth_uid_arg a = { .euid = (uint32_t)strtoul(argv[2], NULL, 10) };
@@ -239,6 +255,7 @@ static int cmd_deluid(int argc, char **argv)
 }
 
 static int cmd_listuid(void)
+// Recupera lista di tutti userid presenti nella configurazione
 {
     uint32_t cnt = 0;
     if (ioctl_get_u32(SCTH_IOC_GET_UID_COUNT, &cnt) != 0) return 1;
@@ -271,6 +288,7 @@ static int cmd_listuid(void)
 
 /* ---- sys ---- */
 static int cmd_addsys(int argc, char **argv)
+// Aggiunge syscall alla configurazione
 {
     if (argc < 3) return -2;
     struct scth_sys_arg a = { .nr = (uint32_t)strtoul(argv[2], NULL, 10) };
@@ -278,6 +296,7 @@ static int cmd_addsys(int argc, char **argv)
 }
 
 static int cmd_delsys(int argc, char **argv)
+// Rimuove syscall dalla configurazione
 {
     if (argc < 3) return -2;
     struct scth_sys_arg a = { .nr = (uint32_t)strtoul(argv[2], NULL, 10) };
@@ -285,6 +304,7 @@ static int cmd_delsys(int argc, char **argv)
 }
 
 static int cmd_listsys(void)
+// Recupera lisa delle syscall presenti nella configurazione
 {
     uint32_t cnt = 0;
     if (ioctl_get_u32(SCTH_IOC_GET_SYS_COUNT, &cnt) != 0) return 1;
@@ -317,6 +337,7 @@ static int cmd_listsys(void)
 
 /* ---- dispatcher ---- */
 int cmd_run(int argc, char **argv)
+// Dispatcher comandi della CLI, mappa argomento tetuale a funzione
 {
     const char *cmd = argv[1];
 

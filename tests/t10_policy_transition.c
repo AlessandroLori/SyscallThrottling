@@ -2,6 +2,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+// verifica corretto funzionamento switch di policy dinamicamente
+
 static pid_t spawn_load_generator(void)
 {
     pid_t pid = fork();

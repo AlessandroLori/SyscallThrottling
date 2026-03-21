@@ -15,43 +15,21 @@
 #define SCTH_LOG_GRANT(...) do { } while (0)
 #endif
 
+
+/* Motore amministrativo del modulo, gestione del monitor in funzione della policy e gestione epoche */
+
+
 struct scth_state g_scth;
-
-/*
-
-python3 - <<'PY'
-import time, subprocess
-N = 20
-DUR = 10
-print(f"[PRESSURE TEST] N={N} processes per burst, duration={DUR}s")
-t_end = time.time() + DUR
-while time.time() < t_end:
-    ps=[subprocess.Popen(["uname"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(N)]
-    for p in ps: p.wait()
-print("done")
-PY
-sudo ./scthctl off
-sudo ./scthctl resetstats
-sudo ./scthctl setmax 3
-sudo ./scthctl setpolicy 1
-sudo ./scthctl on
-sudo ./scthctl delsys 63 2>/dev/null || true
-sudo ./scthctl addsys 63
-sudo ./scthctl delprog uname 2>/dev/null || true
-sudo ./scthctl addprog uname
-
-*/
-
-
-
-
 
 /* Module parameter: sys_call_table address discovered by USCTM */
 static unsigned long sys_call_table_addr = 0;
 module_param(sys_call_table_addr, ulong, 0444);
 MODULE_PARM_DESC(sys_call_table_addr, "Address of sys_call_table (from USCTM), e.g. 0xffffffff...");
 
-static void scth_epoch_timer_fn(struct timer_list *t)
+static void scth_epoch_timer_fn(struct timer_list *t) 
+// Funzione che rende il sistema epoch based. Viene chiamata periodicamente dal timer, è dove avviene il tick del monitor
+// viene incrementata l'epochid e aggiorna gli slot dell'epoca. Se si passa da FIFO a WAKE&RACE i thread rimasti nella coda FIFO vengono
+// drenati.
 {
     unsigned long flags;
     LIST_HEAD(to_wake);
@@ -76,14 +54,7 @@ static void scth_epoch_timer_fn(struct timer_list *t)
     g_scth.blocked_sum_samples += g_scth.current_blocked_threads;
     g_scth.blocked_num_samples++;
 
-/* 
- * IMPORTANTISSIMO:
- * se esistono waiter già accodati in fifo_q, li dreniamo SEMPRE prima,
- * anche se policy_active è ormai WAKE_RACE.
- *
- * Altrimenti i waiter entrati quando la policy era FIFO restano bloccati
- * per sempre sulla loro waitqueue privata.
- */
+
     if (!list_empty(&g_scth.fifo_q)) {
         atomic_set(&g_scth.epoch_tokens, 0);
 
@@ -135,6 +106,8 @@ static void scth_epoch_timer_fn(struct timer_list *t)
 }
 
 int scth_monitor_on(void)
+// Accende il monitor, resetta epochid, applica valori di configurazione in pending, avvia il timer.
+// Porta il sistema da uno stato inerte ad uno stato di possibile throttling
 {
     unsigned long flags;
     bool already_on;
@@ -172,6 +145,7 @@ int scth_monitor_on(void)
 }
 
 int scth_monitor_off(void)
+// Disattiva monitor, ferma il timer, marca aborted tutti i thread che aspettano e libera le code mandando tutti in esecuzione.
 {
     unsigned long flags;
     LIST_HEAD(to_wake);
@@ -214,6 +188,9 @@ int scth_monitor_off(void)
 }
 
 static int __init scth_init(void)
+// Entry point, inizializza tutte le strutture responsabili di sincronizzazione come code, contatori, lock, mutex,
+// registra il device in /dev/scthrottle e legge il parametro sys_call_table_addr proveniente dal modulo in external/
+
 {
     int ret;
 
@@ -283,6 +260,7 @@ static int __init scth_init(void)
 }
 
 static void __exit scth_exit(void)
+// Termina il modulo, triggera lo spegnimento del monitor, rimuove hook attivi e pulisce il sistema.
 {
     scth_monitor_off();
 

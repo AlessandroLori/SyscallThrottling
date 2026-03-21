@@ -1,6 +1,8 @@
 #include "common.h"
 #include <unistd.h>
 
+// verifica che quando monitor viene messo off tutti i thread nelle code passino direttamente in esecuzione
+
 int main(void)
 {
     if (scth_require_root()) return 2;

@@ -19,9 +19,17 @@
 
 #include "scth_internal.h"
 
+
+/* Gestione del syscall throttling, intercettazione e decisione del destino dei thread. 
+    Implementa: meccanismo di hook su syscall table, wrapper per interettazione syscall controllo e 
+    reindirizzamento a meccanismo, policy di scheduling, aggiornamento statistiche */
+
+
 typedef asmlinkage long (*scth_sys_fn_t)(const struct pt_regs *regs);
 
 static scth_sys_fn_t *scth_syscall_table(void)
+// Responsabile di punto di accesso alla syscall table senza duplicare la logica, restituisce il puntatore alla syscall table
+
 {
     if (!g_scth.sys_call_table_addr)
         return NULL;
@@ -39,18 +47,22 @@ struct scth_wp_ctx {
 };
 
 static __always_inline void write_cr0_forced(unsigned long val)
+// Scrive forzosamente nel registro CR0, usato per disabilitare e riabilitare il bit di write protect per poter modificare la syscall table
 {
     unsigned long __force_order;
     asm volatile("mov %0, %%cr0" : "+r"(val), "+m"(__force_order));
 }
 
 static __always_inline void write_cr4_forced(unsigned long val)
+// Scrive forzosamente nel registro CR4 per poter patchare la tabella
 {
     unsigned long __force_order;
     asm volatile("mov %0, %%cr4" : "+r"(val), "+m"(__force_order));
 }
 
 static __always_inline void scth_wp_off(struct scth_wp_ctx *ctx)
+// Prepara patching alla syscall table disabilitando preemption e salvando CR0 e CR4 creando una finestra critica in cui il modulo può
+// scrivere su syscall table
 {
     preempt_disable();
     local_irq_save(ctx->irqflags);
@@ -67,6 +79,8 @@ static __always_inline void scth_wp_off(struct scth_wp_ctx *ctx)
 }
 
 static __always_inline void scth_wp_on(struct scth_wp_ctx *ctx)
+// Fase finale di scrittura su syscall table, ripristina i CR e la preemption
+
 {
     write_cr0_forced(ctx->cr0);
 
@@ -81,6 +95,7 @@ static __always_inline void scth_wp_on(struct scth_wp_ctx *ctx)
 
 /* ---- cfg match: (prog OR uid) ---- */
 static bool scth_match_prog_or_uid(const char comm[SCTH_COMM_LEN], u32 euid)
+// Contorlla il matching su program names o userid ovvero controlla se il thread corrente deve essere sottoposto a throttling
 {
     bool match;
 
@@ -93,6 +108,8 @@ static bool scth_match_prog_or_uid(const char comm[SCTH_COMM_LEN], u32 euid)
 
 /* ---- blocked helpers (per stats) ---- */
 static __always_inline void scth_blocked_inc_locked(void)
+// Incrementa il numero di thread bloccati e aumenta il picco di thread massimi bloccati se necessario
+
 {
     g_scth.current_blocked_threads++;
     if (g_scth.current_blocked_threads > g_scth.peak_blocked_threads)
@@ -100,12 +117,14 @@ static __always_inline void scth_blocked_inc_locked(void)
 }
 
 static __always_inline void scth_blocked_dec_locked(void)
+// Decrementa il numero di thread bloccati
 {
     if (g_scth.current_blocked_threads)
         g_scth.current_blocked_threads--;
 }
 
 static __always_inline void scth_blocked_inc(void)
+//Prende il lock, incrementa e lo rilascia
 {
     unsigned long flags;
     spin_lock_irqsave(&g_scth.lock, flags);
@@ -114,6 +133,7 @@ static __always_inline void scth_blocked_inc(void)
 }
 
 static __always_inline void scth_blocked_dec(void)
+// Prende il lock, decrementa e lo rilascia 
 {
     unsigned long flags;
     spin_lock_irqsave(&g_scth.lock, flags);
@@ -125,6 +145,7 @@ static __always_inline void scth_blocked_dec(void)
 static __always_inline void scth_update_peak_delay(u64 delay_ns,
                                                    const char comm[SCTH_COMM_LEN],
                                                    u32 euid)
+// Aggiorna il ritardo massimo osservato                                                
 {
     unsigned long flags;
     spin_lock_irqsave(&g_scth.lock, flags);
@@ -140,16 +161,19 @@ static __always_inline void scth_update_peak_delay(u64 delay_ns,
 
 /* ---- aggregate stats helpers ---- */
 static __always_inline void scth_stat_tracked(void)
+// Conta quante syscall sono entrate nel sistema di throttling (aspettando)
 {
     atomic64_inc(&g_scth.total_tracked);
 }
 
 static __always_inline void scth_stat_immediate(void)
+// Conta quante syscall sono entrate nel sistema di throttling senza dover aspettare
 {
     atomic64_inc(&g_scth.total_immediate);
 }
 
 static __always_inline void scth_stat_aborted(void)
+// Conta quante syscall sono entrate nel sistema di throttling ma poi abortite per qualche motivo
 {
     atomic64_inc(&g_scth.total_aborted);
 }
@@ -157,6 +181,7 @@ static __always_inline void scth_stat_aborted(void)
 static __always_inline void scth_stat_delayed(u64 delay_ns,
                                               const char comm[SCTH_COMM_LEN],
                                               u32 euid)
+// Aggiorna le statistiche inerenti ai ritardi                                             
 {
     atomic64_inc(&g_scth.total_delayed);
     atomic64_add(delay_ns, &g_scth.delay_sum_ns);
@@ -166,6 +191,8 @@ static __always_inline void scth_stat_delayed(u64 delay_ns,
 
 /* ---- WAKE_RACE token acquire (per-epoch) ---- */
 static __always_inline bool scth_try_take_token(void)
+// Implementa la vera gara in WAKE&RACE in cui i thread eseguono cmpxchng per poter decrementare il numero di slot disponibili in epoca
+// e se ha successo ottiene lo slot di esecuzione per questa epoca
 {
     int v;
 
@@ -181,6 +208,10 @@ static __always_inline bool scth_try_take_token(void)
 
 /* ---- wrapper M3: FIFO_STRICT vs WAKE_RACE ---- */
 static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
+// Implementa sostituzione syscall in syscall table, bypass se monitor off, legge policy e la applica se FIFO o WAKE&RACE.
+// Punto in cui viene effettuata la distinzione tra bypass, immidiate, delayed e aborted.
+// Possiede logica FIFO e gestione della coda, risvegli e bypass
+// Possiede logica WAKE&RACE e gestione del risveglio di tutti e di disponibilità slot (token) per epoca
 {
     u32 nr = (u32)regs->orig_ax;
     scth_sys_fn_t orig;
@@ -368,6 +399,7 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 }
 
 int scth_hook_install(u32 nr)
+// Rende syscall ordinaria syscall gestita dal wrapper
 {
     scth_sys_fn_t *table;
     scth_sys_fn_t cur;
@@ -386,7 +418,7 @@ int scth_hook_install(u32 nr)
     cur = READ_ONCE(table[nr]);
     if (cur == scth_syscall_wrapper) {
         WRITE_ONCE(scth_hooked[nr], true);
-        return -EALREADY;
+        return 0;
     }
 
     WRITE_ONCE(scth_orig[nr], cur);
@@ -401,6 +433,7 @@ int scth_hook_install(u32 nr)
 }
 
 int scth_hook_remove(u32 nr)
+// Ripristina puntatore originale nella syscall table
 {
     scth_sys_fn_t *table;
     scth_sys_fn_t orig;
@@ -430,6 +463,7 @@ int scth_hook_remove(u32 nr)
 }
 
 void scth_hook_remove_all(void)
+// Rimuove ogni hook presente, usato in unload
 {
     u32 nr;
     for (nr = 0; nr < NR_syscalls; nr++) {

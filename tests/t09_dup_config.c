@@ -1,6 +1,8 @@
 #include "common.h"
 #include <unistd.h>
 
+// verifica eventuali errori aggiungendo o rimuovendo più volte stessa sys, userid o programname
+
 int main(void)
 {
     if (scth_require_root()) return 2;

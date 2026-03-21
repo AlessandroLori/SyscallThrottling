@@ -8,7 +8,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* Framework di preparazione ambiente per i test */
+
 static int open_dev(void)
+// Apre device /dev/scthrottle per i test
 {
     char path[128];
     snprintf(path, sizeof(path), "/dev/%s", SCTH_DEV_NAME);
@@ -16,6 +19,8 @@ static int open_dev(void)
 }
 
 static int do_ioctl0(unsigned long req)
+// Ioctl helper per far si che i test possano usare assert senza problemi
+
 {
     int fd = open_dev();
     if (fd < 0)
@@ -32,6 +37,7 @@ static int do_ioctl0(unsigned long req)
 }
 
 static int do_ioctl_ptr(unsigned long req, void *arg)
+// Come do_ioctl0 ma con puntatore
 {
     int fd = open_dev();
     if (fd < 0)
@@ -48,6 +54,7 @@ static int do_ioctl_ptr(unsigned long req, void *arg)
 }
 
 int scth_require_root(void)
+// Serve per verificare se il test gira in root
 {
     if (geteuid() != 0) {
         fprintf(stderr, "[FAIL] run this test with sudo/root\n");
@@ -57,6 +64,7 @@ int scth_require_root(void)
 }
 
 const char *scth_policy_name(__u32 p)
+// Converte codice in stringa, serve per stampare cfg e stats
 {
     switch (p) {
     case SCTH_POLICY_FIFO_STRICT: return "FIFO_STRICT";
@@ -65,23 +73,23 @@ const char *scth_policy_name(__u32 p)
     }
 }
 
-int scth_on(void)                { return do_ioctl0(SCTH_IOC_ON); }
-int scth_off(void)               { return do_ioctl0(SCTH_IOC_OFF); }
-int scth_resetstats(void)        { return do_ioctl0(SCTH_IOC_RESET_STATS); }
-int scth_setmax(__u32 v)         { return do_ioctl_ptr(SCTH_IOC_SET_MAX, &v); }
-int scth_setpolicy(__u32 v)      { return do_ioctl_ptr(SCTH_IOC_SET_POLICY, &v); }
-int scth_get_cfg(struct scth_cfg *cfg)
+int scth_on(void)                { return do_ioctl0(SCTH_IOC_ON); } // serve per test monitor on
+int scth_off(void)               { return do_ioctl0(SCTH_IOC_OFF); } // serve per test monitor off
+int scth_resetstats(void)        { return do_ioctl0(SCTH_IOC_RESET_STATS); } //serve per test resetstats
+int scth_setmax(__u32 v)         { return do_ioctl_ptr(SCTH_IOC_SET_MAX, &v); } // idem per setmax
+int scth_setpolicy(__u32 v)      { return do_ioctl_ptr(SCTH_IOC_SET_POLICY, &v); } // idem per policy
+int scth_get_cfg(struct scth_cfg *cfg) // idem per get cfg
 {
     memset(cfg, 0, sizeof(*cfg));
     return do_ioctl_ptr(SCTH_IOC_GET_CFG, cfg);
 }
-int scth_get_stats(struct scth_stats *st)
+int scth_get_stats(struct scth_stats *st) // idem per stats
 {
     memset(st, 0, sizeof(*st));
     return do_ioctl_ptr(SCTH_IOC_GET_STATS, st);
 }
 
-int scth_add_prog(const char *comm)
+int scth_add_prog(const char *comm) //aggiunge programma alla config di test
 {
     struct scth_prog_arg a;
     memset(&a, 0, sizeof(a));
@@ -89,7 +97,7 @@ int scth_add_prog(const char *comm)
     return do_ioctl_ptr(SCTH_IOC_ADD_PROG, &a);
 }
 
-int scth_del_prog(const char *comm)
+int scth_del_prog(const char *comm) //rimuove programma dalla config di test
 {
     struct scth_prog_arg a;
     memset(&a, 0, sizeof(a));
@@ -97,31 +105,31 @@ int scth_del_prog(const char *comm)
     return do_ioctl_ptr(SCTH_IOC_DEL_PROG, &a);
 }
 
-int scth_add_uid(__u32 euid)
+int scth_add_uid(__u32 euid) // aggiunge userid alla config di test
 {
     struct scth_uid_arg a = { .euid = euid };
     return do_ioctl_ptr(SCTH_IOC_ADD_UID, &a);
 }
 
-int scth_del_uid(__u32 euid)
+int scth_del_uid(__u32 euid) // rimuove userid dalla config di test
 {
     struct scth_uid_arg a = { .euid = euid };
     return do_ioctl_ptr(SCTH_IOC_DEL_UID, &a);
 }
 
-int scth_add_sys(__u32 nr)
+int scth_add_sys(__u32 nr) // aggiunge syscall alla config di test
 {
     struct scth_sys_arg a = { .nr = nr };
     return do_ioctl_ptr(SCTH_IOC_ADD_SYS, &a);
 }
 
-int scth_del_sys(__u32 nr)
+int scth_del_sys(__u32 nr) // rimuove syscall dalla config di test
 {
     struct scth_sys_arg a = { .nr = nr };
     return do_ioctl_ptr(SCTH_IOC_DEL_SYS, &a);
 }
 
-int scth_del_prog_ignore(const char *comm)
+int scth_del_prog_ignore(const char *comm) //tollera la delete di un program names già non esistente
 {
     int rc = scth_del_prog(comm);
     if (rc == -ENOENT)
@@ -129,7 +137,7 @@ int scth_del_prog_ignore(const char *comm)
     return rc;
 }
 
-int scth_del_uid_ignore(__u32 euid)
+int scth_del_uid_ignore(__u32 euid) // tollera idem ma per userid
 {
     int rc = scth_del_uid(euid);
     if (rc == -ENOENT)
@@ -137,7 +145,7 @@ int scth_del_uid_ignore(__u32 euid)
     return rc;
 }
 
-int scth_del_sys_ignore(__u32 nr)
+int scth_del_sys_ignore(__u32 nr) // tollera idem ma per syscall
 {
     int rc = scth_del_sys(nr);
     if (rc == -ENOENT)
@@ -145,7 +153,7 @@ int scth_del_sys_ignore(__u32 nr)
     return rc;
 }
 
-int scth_setup_base(__u32 max_active, __u32 policy)
+int scth_setup_base(__u32 max_active, __u32 policy) // prepara config base per test
 {
     int rc;
     rc = scth_off(); if (rc < 0) return rc;
@@ -156,7 +164,7 @@ int scth_setup_base(__u32 max_active, __u32 policy)
     return 0;
 }
 
-int scth_cleanup_common(void)
+int scth_cleanup_common(void) // pulisce configurazione per test
 {
     int rc;
     rc = scth_del_sys_ignore(63); if (rc < 0) return rc;
@@ -167,7 +175,7 @@ int scth_cleanup_common(void)
     return 0;
 }
 
-pid_t scth_spawn_quiet(const char *prog, char *const argv[])
+pid_t scth_spawn_quiet(const char *prog, char *const argv[]) // genera workload senza sporcare output
 {
     pid_t pid = fork();
     if (pid < 0)
@@ -188,7 +196,7 @@ pid_t scth_spawn_quiet(const char *prog, char *const argv[])
     return pid;
 }
 
-int scth_spawn_many_uname(pid_t *pids, size_t n)
+int scth_spawn_many_uname(pid_t *pids, size_t n) // lancia n programmi uname silenziosi
 {
     for (size_t i = 0; i < n; i++) {
         char *const argv[] = { (char *)"uname", NULL };
@@ -199,7 +207,7 @@ int scth_spawn_many_uname(pid_t *pids, size_t n)
     return 0;
 }
 
-int scth_spawn_many_python_getpid(pid_t *pids, size_t n)
+int scth_spawn_many_python_getpid(pid_t *pids, size_t n) // lancia n processi python che eseguono os.getpid()
 {
     for (size_t i = 0; i < n; i++) {
         char *const argv[] = {
@@ -215,7 +223,7 @@ int scth_spawn_many_python_getpid(pid_t *pids, size_t n)
     return 0;
 }
 
-int scth_wait_all(pid_t *pids, size_t n)
+int scth_wait_all(pid_t *pids, size_t n) // aspetta tutti i figli per terminazione corretta
 {
     for (size_t i = 0; i < n; i++) {
         int status = 0;
@@ -227,7 +235,7 @@ int scth_wait_all(pid_t *pids, size_t n)
     return 0;
 }
 
-void scth_print_cfg(const struct scth_cfg *cfg)
+void scth_print_cfg(const struct scth_cfg *cfg) // stampa configurazione suite di test
 {
     printf("abi=%u monitor_on=%u epoch_id=%" PRIu64 "\n",
            cfg->abi_version, cfg->monitor_on, (uint64_t)cfg->epoch_id);
@@ -237,7 +245,7 @@ void scth_print_cfg(const struct scth_cfg *cfg)
            cfg->policy_pending, scth_policy_name(cfg->policy_pending));
 }
 
-void scth_print_stats(const struct scth_stats *s)
+void scth_print_stats(const struct scth_stats *s) // stampa statistiche raccolte durante test
 {
     double avg_blocked = 0.0;
     double avg_delay = 0.0;

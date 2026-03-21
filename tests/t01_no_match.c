@@ -1,6 +1,8 @@
 #include "common.h"
 #include <string.h>
 
+// verifico che non throttli nulla quando monitor on, syscall true ma program names o userid false
+
 int main(void)
 {
     if (scth_require_root()) return 2;

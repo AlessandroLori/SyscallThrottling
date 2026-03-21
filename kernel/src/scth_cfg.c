@@ -3,16 +3,19 @@
 #include <linux/jhash.h>
 #include <linux/bitmap.h>
 #include <linux/hash.h>
-
 #include "scth_internal.h"
 
+/* Database intenro, mantiene e manipola strutture rappresentanti program names, userid, syscall number selezionate */
+
 static inline u32 hash_comm(const char comm[SCTH_COMM_LEN])
+// Calcola hash del program name, serve per aggiungerlo poi nell'hashtable dei nomi
 {
     /* hash su 16 byte fissi (comm include NUL/padding) */
     return jhash(comm, SCTH_COMM_LEN, 0);
 }
 
 void scth_cfg_init(struct scth_cfg_store *c)
+// Inizializza lo store con hash table per porgram names e userid, bitmap per syscall e contatori
 {
     int i;
     for (i = 0; i < (1 << SCTH_PROG_HT_BITS); i++)
@@ -28,6 +31,7 @@ void scth_cfg_init(struct scth_cfg_store *c)
 }
 
 void scth_cfg_destroy(struct scth_cfg_store *c)
+// Usata in cleanup del modulo, pulisce le strutture precedenetemente nominate
 {
     int b;
     struct scth_prog_ent *pe;
@@ -57,6 +61,7 @@ void scth_cfg_destroy(struct scth_cfg_store *c)
 /* -------- Programs -------- */
 
 bool scth_cfg_has_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN])
+// Controlla la presenza di un program names nelle strutture
 {
     u32 key = hash_comm(comm);
     u32 idx = key & ((1 << SCTH_PROG_HT_BITS) - 1);
@@ -70,6 +75,7 @@ bool scth_cfg_has_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN])
 }
 
 int scth_cfg_add_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN])
+// Aggiunge un nuovo program names nelle hashtable
 {
     u32 key = hash_comm(comm);
     u32 idx = key & ((1 << SCTH_PROG_HT_BITS) - 1);
@@ -92,6 +98,7 @@ int scth_cfg_add_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN])
 }
 
 int scth_cfg_del_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN])
+// Rimuove un program names presente nelle hashtable
 {
     u32 key = hash_comm(comm);
     u32 idx = key & ((1 << SCTH_PROG_HT_BITS) - 1);
@@ -109,11 +116,13 @@ int scth_cfg_del_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN])
 }
 
 __u32 scth_cfg_prog_count(struct scth_cfg_store *c)
+// Restituisce numero di program names registrati
 {
     return c->prog_count;
 }
 
 __u32 scth_cfg_fill_prog_list(struct scth_cfg_store *c, struct scth_prog_arg *out, __u32 cap)
+// Esporta la configurazione a user-space
 {
     __u32 n = 0;
     int b;
@@ -132,6 +141,7 @@ __u32 scth_cfg_fill_prog_list(struct scth_cfg_store *c, struct scth_prog_arg *ou
 /* -------- UIDs -------- */
 
 bool scth_cfg_has_uid(struct scth_cfg_store *c, __u32 euid)
+// Controlla se userid è presente e registrata
 {
     u32 idx = hash_32(euid, SCTH_UID_HT_BITS);
     struct scth_uid_ent *e;
@@ -144,6 +154,7 @@ bool scth_cfg_has_uid(struct scth_cfg_store *c, __u32 euid)
 }
 
 int scth_cfg_add_uid(struct scth_cfg_store *c, __u32 euid)
+// Aggiunge un nuovo userid alle hashtable
 {
     u32 idx = hash_32(euid, SCTH_UID_HT_BITS);
     struct scth_uid_ent *e;
@@ -164,6 +175,7 @@ int scth_cfg_add_uid(struct scth_cfg_store *c, __u32 euid)
 }
 
 int scth_cfg_del_uid(struct scth_cfg_store *c, __u32 euid)
+// Rimuove un userid dalle hashtable
 {
     u32 idx = hash_32(euid, SCTH_UID_HT_BITS);
     struct scth_uid_ent *e;
@@ -180,11 +192,13 @@ int scth_cfg_del_uid(struct scth_cfg_store *c, __u32 euid)
 }
 
 __u32 scth_cfg_uid_count(struct scth_cfg_store *c)
+// Resituisce quanti userid sono registrati
 {
     return c->uid_count;
 }
 
 __u32 scth_cfg_fill_uid_list(struct scth_cfg_store *c, __u32 *out, __u32 cap)
+// Esporta gli userid registrati verso user-space
 {
     __u32 n = 0;
     int b;
@@ -202,6 +216,7 @@ __u32 scth_cfg_fill_uid_list(struct scth_cfg_store *c, __u32 *out, __u32 cap)
 /* -------- Syscalls -------- */
 
 bool scth_cfg_has_sys(struct scth_cfg_store *c, __u32 nr)
+// Contorlla presenza di syscall registrata nella bitmap
 {
     if (nr >= NR_syscalls)
         return false;
@@ -209,6 +224,7 @@ bool scth_cfg_has_sys(struct scth_cfg_store *c, __u32 nr)
 }
 
 int scth_cfg_add_sys(struct scth_cfg_store *c, __u32 nr)
+// Aggiunge nuova syscall nella bitmap
 {
     if (nr >= NR_syscalls)
         return -EINVAL;
@@ -219,6 +235,7 @@ int scth_cfg_add_sys(struct scth_cfg_store *c, __u32 nr)
 }
 
 int scth_cfg_del_sys(struct scth_cfg_store *c, __u32 nr)
+// Rimuove syscall dalla bitmap
 {
     if (nr >= NR_syscalls)
         return -EINVAL;
@@ -229,11 +246,13 @@ int scth_cfg_del_sys(struct scth_cfg_store *c, __u32 nr)
 }
 
 __u32 scth_cfg_sys_count(struct scth_cfg_store *c)
+// Ritorna numero di syscall nella bitmap
 {
     return c->sys_count;
 }
 
 __u32 scth_cfg_fill_sys_list(struct scth_cfg_store *c, __u32 *out, __u32 cap)
+// Eposrta le syscall configurate verso user-space
 {
     __u32 n = 0;
     __u32 nr;

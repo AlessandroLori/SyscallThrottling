@@ -1,5 +1,7 @@
 #include "common.h"
 
+// verifico che quando thrott_threads < epoch_budget allora passa tutto senza ritardi
+
 int main(void)
 {
     if (scth_require_root()) return 2;

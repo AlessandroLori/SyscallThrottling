@@ -1,5 +1,7 @@
 #include "common.h"
 
+// verifica funzionamento throttling con più syscall diverse
+
 int main(void)
 {
     if (scth_require_root()) return 2;

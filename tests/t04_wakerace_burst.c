@@ -1,5 +1,8 @@
 #include "common.h"
 
+// verifica funzionamento WAKE&RACE, genera più syscall di budget epoca, verifica ritardi e effettivo passaggio di syscall = budget 
+//  per epoca
+
 int main(void)
 {
     if (scth_require_root()) return 2;

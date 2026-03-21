@@ -5,15 +5,19 @@
 #include <linux/string.h>
 #include <linux/errno.h>
 #include <linux/spinlock.h>
-
 #include "scth_internal.h"
 
+/* Contorllo amministrativo del modulo. Gestisce le variazioni di settings passati da temrinale, valida argomenti passati e permessi
+    root */
+
 static inline bool scth_is_root(void)
+// Controlla se utente è root
 {
     return uid_eq(current_euid(), GLOBAL_ROOT_UID);
 }
 
 static void scth_stats_reset_locked(void)
+// Resetta tutte statistiche del modulo
 {
     /* peak delay */
     g_scth.peak_delay_ns = 0;
@@ -38,13 +42,18 @@ static void scth_stats_reset_locked(void)
 }
 
 long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
+// Dispatcher centrale di ioctl, riceve comando e sceglie operaizone da eseguire
 {
     switch (cmd) {
 
     case SCTH_IOC_ON:
+        if (!scth_is_root())
+            return -EPERM;
         return scth_monitor_on();
 
     case SCTH_IOC_OFF:
+        if (!scth_is_root())
+            return -EPERM;
         return scth_monitor_off();
 
     case SCTH_IOC_SET_MAX: {
@@ -290,29 +299,53 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
     /* ---- SYS ---- */
     case SCTH_IOC_ADD_SYS: {
         struct scth_sys_arg a;
-        int ret;
-        if (!scth_is_root()) return -EPERM;
-        if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
+        int ret, hook_ret;
+
+        if (!scth_is_root())
+            return -EPERM;
+
+        if (copy_from_user(&a, (void __user *)arg, sizeof(a)))
+            return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
+
         ret = scth_cfg_add_sys(&g_scth.cfg, a.nr);
+        if (ret == 0) {
+            hook_ret = scth_hook_install(a.nr);
+            if (hook_ret != 0) {
+                /* rollback: niente inserimento fantasma */
+                scth_cfg_del_sys(&g_scth.cfg, a.nr);
+                ret = hook_ret;
+            }
+        }
+
         mutex_unlock(&g_scth.cfg_mutex);
-        if (ret == 0)
-            scth_hook_install(a.nr);
         return ret;
     }
 
     case SCTH_IOC_DEL_SYS: {
         struct scth_sys_arg a;
-        int ret;
-        if (!scth_is_root()) return -EPERM;
-        if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
+        int ret, hook_ret;
+
+        if (!scth_is_root())
+            return -EPERM;
+
+        if (copy_from_user(&a, (void __user *)arg, sizeof(a)))
+            return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
+
         ret = scth_cfg_del_sys(&g_scth.cfg, a.nr);
+        if (ret == 0) {
+            hook_ret = scth_hook_remove(a.nr);
+            if (hook_ret != 0) {
+                /* rollback: se l’unhook fallisce, ripristino la config */
+                scth_cfg_add_sys(&g_scth.cfg, a.nr);
+                ret = hook_ret;
+            }
+        }
+
         mutex_unlock(&g_scth.cfg_mutex);
-        if (ret == 0)
-            scth_hook_remove(a.nr);
         return ret;
     }
 

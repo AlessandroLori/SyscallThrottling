@@ -1,5 +1,7 @@
 #include "common.h"
 
+// verifica valore accettabile da setmax, 0 non è accettato per scelta progettuale e torna errore
+
 int main(void)
 {
     if (scth_require_root()) return 2;

@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+// verifica permessi nelle operazioni, thread non root non può fare tutto
+
 static int run_as_unpriv(uid_t uid, gid_t gid)
 {
     if (setgid(gid) != 0) return -errno;

@@ -3,6 +3,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+// verifica funzionamento throttlando su userid non root
+
 static int drop_to_sudo_user(uid_t *uid_out, gid_t *gid_out)
 {
     const char *suid = getenv("SUDO_UID");
