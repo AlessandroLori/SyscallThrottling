@@ -33,7 +33,8 @@ static void scth_epoch_timer_fn(struct timer_list *t)
 {
     unsigned long flags;
     LIST_HEAD(to_wake);
-    bool wake_race = false;
+    bool wake_epoch_waiters = false;
+    __u8 old_policy;
 
     spin_lock_irqsave(&g_scth.lock, flags);
 
@@ -46,6 +47,8 @@ static void scth_epoch_timer_fn(struct timer_list *t)
     g_scth.epoch_id++;
     g_scth.epoch_used = 0;
 
+    old_policy = g_scth.policy_active;
+
     /* apply pending -> active */
     g_scth.max_active    = g_scth.max_pending;
     g_scth.policy_active = g_scth.policy_pending;
@@ -54,6 +57,14 @@ static void scth_epoch_timer_fn(struct timer_list *t)
     g_scth.blocked_sum_samples += g_scth.current_blocked_threads;
     g_scth.blocked_num_samples++;
 
+    /*
+     * Se passiamo da WAKE_RACE a FIFO, devo svegliare i waiter su epoch_wq
+     * affinché si auto-migrino nella fifo_q.
+     */
+    if (old_policy == SCTH_POLICY_WAKE_RACE &&
+        g_scth.policy_active == SCTH_POLICY_FIFO_STRICT) {
+        wake_epoch_waiters = true;
+    }
 
     if (!list_empty(&g_scth.fifo_q)) {
         atomic_set(&g_scth.epoch_tokens, 0);
@@ -72,8 +83,8 @@ static void scth_epoch_timer_fn(struct timer_list *t)
                            g_scth.epoch_id,
                            w->ticket,
                            g_scth.epoch_used,
-                        g_scth.max_active,
-                        g_scth.fifo_qlen);
+                           g_scth.max_active,
+                           g_scth.fifo_qlen);
 
             g_scth.epoch_used++;
 
@@ -83,7 +94,7 @@ static void scth_epoch_timer_fn(struct timer_list *t)
 
     } else if (g_scth.policy_active == SCTH_POLICY_WAKE_RACE) {
         atomic_set(&g_scth.epoch_tokens, (int)g_scth.max_active);
-        wake_race = true;
+        wake_epoch_waiters = true;
 
     } else {
         atomic_set(&g_scth.epoch_tokens, 0);
@@ -94,7 +105,7 @@ static void scth_epoch_timer_fn(struct timer_list *t)
 
     spin_unlock_irqrestore(&g_scth.lock, flags);
 
-    if (wake_race)
+    if (wake_epoch_waiters)
         wake_up_all(&g_scth.epoch_wq);
 
     /* sveglia FIFO granted */
@@ -198,6 +209,10 @@ static int __init scth_init(void)
     spin_lock_init(&g_scth.lock);
     mutex_init(&g_scth.cfg_mutex);
     init_waitqueue_head(&g_scth.epoch_wq);
+    init_waitqueue_head(&g_scth.unload_wq);
+
+    g_scth.stopping = false;
+    atomic_set(&g_scth.active_wrappers, 0);
 
     atomic64_set(&g_scth.total_tracked, 0);
     atomic64_set(&g_scth.total_immediate, 0);
@@ -210,7 +225,13 @@ static int __init scth_init(void)
     g_scth.fifo_qlen = 0;
     atomic64_set(&g_scth.fifo_seq, 0);
 
-    scth_cfg_init(&g_scth.cfg);
+    {
+        struct scth_cfg_store *cfg0 = scth_cfg_alloc_empty(GFP_KERNEL);
+        if (!cfg0)
+            return -ENOMEM;
+
+        rcu_assign_pointer(g_scth.cfg, cfg0);
+    }
 
     /* default */
     g_scth.monitor_on = false;
@@ -251,6 +272,15 @@ static int __init scth_init(void)
 
     ret = scth_dev_init();
     if (ret) {
+        struct scth_cfg_store *cfg0;
+
+        mutex_lock(&g_scth.cfg_mutex);
+        cfg0 = rcu_dereference_protected(g_scth.cfg, lockdep_is_held(&g_scth.cfg_mutex));
+        RCU_INIT_POINTER(g_scth.cfg, NULL);
+        mutex_unlock(&g_scth.cfg_mutex);
+
+        scth_cfg_destroy(cfg0);
+
         pr_err("scthrottle: failed to init device: %d\n", ret);
         return ret;
     }
@@ -262,13 +292,30 @@ static int __init scth_init(void)
 static void __exit scth_exit(void)
 // Termina il modulo, triggera lo spegnimento del monitor, rimuove hook attivi e pulisce il sistema.
 {
+    struct scth_cfg_store *cfg;
+
+    WRITE_ONCE(g_scth.stopping, true);
+
     scth_monitor_off();
+    scth_hook_remove_all();
+
+    wait_event(g_scth.unload_wq,
+               atomic_read(&g_scth.active_wrappers) == 0);
 
     mutex_lock(&g_scth.cfg_mutex);
-    scth_cfg_destroy(&g_scth.cfg);
+    cfg = rcu_dereference_protected(g_scth.cfg, lockdep_is_held(&g_scth.cfg_mutex));
+    RCU_INIT_POINTER(g_scth.cfg, NULL);
     mutex_unlock(&g_scth.cfg_mutex);
 
-    scth_hook_remove_all();
+    synchronize_rcu();
+    scth_cfg_destroy(cfg);
+
+    /*
+     * Importante: drena eventuali call_rcu() pendenti generate da vecchi update
+     * della config, così nessun callback del modulo resta in coda dopo l'unload.
+     */
+    rcu_barrier();
+
     scth_dev_exit();
     pr_info("scthrottle: unloaded\n");
 }

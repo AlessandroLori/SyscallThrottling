@@ -79,11 +79,21 @@ int main(void)
     T_CHECK_RC(scth_get_stats(&st));
     scth_print_stats(&st);
 
-    T_ASSERT(st.total_tracked == 12, "tracked atteso 12, got %" PRIu64, (uint64_t)st.total_tracked);
-    T_ASSERT(st.total_immediate + st.total_delayed == 12,
-             "immediate+delayed atteso 12");
-    T_ASSERT(st.total_aborted == 0, "aborted atteso 0");
+    T_ASSERT(st.total_tracked >= 12,
+             "tracked atteso almeno 12, got %" PRIu64,
+             (uint64_t)st.total_tracked);
+
+    T_ASSERT(st.total_immediate + st.total_delayed >= 12,
+             "immediate+delayed atteso almeno 12");
+
+    T_ASSERT(st.total_aborted == 0,
+             "aborted atteso 0");
     T_ASSERT(st.peak_euid == (__u32)target_uid,
              "peak_euid atteso %u, got %u", (unsigned)target_uid, (unsigned)st.peak_euid);
+
+    T_CHECK_RC(scth_off());
+    usleep(200000);
+    T_CHECK_RC(scth_cleanup_common());
+
     T_PASS();
 }

@@ -14,10 +14,11 @@ static inline u32 hash_comm(const char comm[SCTH_COMM_LEN])
     return jhash(comm, SCTH_COMM_LEN, 0);
 }
 
-void scth_cfg_init(struct scth_cfg_store *c)
-// Inizializza lo store con hash table per porgram names e userid, bitmap per syscall e contatori
+static void scth_cfg_init_store(struct scth_cfg_store *c)
+// Inizializza lo store con hash table per program names e userid, bitmap per syscall e contatori
 {
     int i;
+
     for (i = 0; i < (1 << SCTH_PROG_HT_BITS); i++)
         INIT_HLIST_HEAD(&c->prog_ht[i]);
     for (i = 0; i < (1 << SCTH_UID_HT_BITS); i++)
@@ -30,12 +31,27 @@ void scth_cfg_init(struct scth_cfg_store *c)
     c->sys_count  = 0;
 }
 
+struct scth_cfg_store *scth_cfg_alloc_empty(gfp_t gfp)
+{
+    struct scth_cfg_store *c;
+
+    c = kzalloc(sizeof(*c), gfp);
+    if (!c)
+        return NULL;
+
+    scth_cfg_init_store(c);
+    return c;
+}
+
 void scth_cfg_destroy(struct scth_cfg_store *c)
 // Usata in cleanup del modulo, pulisce le strutture precedenetemente nominate
 {
     int b;
     struct scth_prog_ent *pe;
     struct hlist_node *tmp;
+
+    if (!c)
+        return;
 
     for (b = 0; b < (1 << SCTH_PROG_HT_BITS); b++) {
         hlist_for_each_entry_safe(pe, tmp, &c->prog_ht[b], node) {
@@ -56,6 +72,8 @@ void scth_cfg_destroy(struct scth_cfg_store *c)
 
     bitmap_zero(c->sys_bitmap, NR_syscalls);
     c->prog_count = c->uid_count = c->sys_count = 0;
+
+    kfree(c);
 }
 
 /* -------- Programs -------- */
@@ -262,4 +280,66 @@ __u32 scth_cfg_fill_sys_list(struct scth_cfg_store *c, __u32 *out, __u32 cap)
             out[n++] = nr;
     }
     return n;
+}
+
+struct scth_cfg_store *scth_cfg_clone(const struct scth_cfg_store *src, gfp_t gfp)
+{
+    struct scth_cfg_store *dst;
+    int b;
+
+    dst = scth_cfg_alloc_empty(gfp);
+    if (!dst)
+        return NULL;
+
+    if (!src)
+        return dst;
+
+    bitmap_copy(dst->sys_bitmap, src->sys_bitmap, NR_syscalls);
+    dst->prog_count = src->prog_count;
+    dst->uid_count  = src->uid_count;
+    dst->sys_count  = src->sys_count;
+
+    for (b = 0; b < (1 << SCTH_PROG_HT_BITS); b++) {
+        struct scth_prog_ent *pe;
+
+        hlist_for_each_entry(pe, &src->prog_ht[b], node) {
+            struct scth_prog_ent *ne = kzalloc(sizeof(*ne), gfp);
+            if (!ne) {
+                scth_cfg_destroy(dst);
+                return NULL;
+            }
+
+            memcpy(ne->comm, pe->comm, SCTH_COMM_LEN);
+            hlist_add_head(&ne->node, &dst->prog_ht[b]);
+        }
+    }
+
+    for (b = 0; b < (1 << SCTH_UID_HT_BITS); b++) {
+        struct scth_uid_ent *ue;
+
+        hlist_for_each_entry(ue, &src->uid_ht[b], node) {
+            struct scth_uid_ent *ne = kzalloc(sizeof(*ne), gfp);
+            if (!ne) {
+                scth_cfg_destroy(dst);
+                return NULL;
+            }
+
+            ne->euid = ue->euid;
+            hlist_add_head(&ne->node, &dst->uid_ht[b]);
+        }
+    }
+
+    return dst;
+}
+
+static void scth_cfg_rcu_free(struct rcu_head *rh)
+{
+    struct scth_cfg_store *c = container_of(rh, struct scth_cfg_store, rcu);
+    scth_cfg_destroy(c);
+}
+
+void scth_cfg_retire(struct scth_cfg_store *c)
+{
+    if (c)
+        call_rcu(&c->rcu, scth_cfg_rcu_free);
 }

@@ -15,7 +15,9 @@ TESTS = \
 	t10_policy_transition \
 	t11_nonroot_uid_match \
 	t12_root_uid_nomatch \
-	t13_setmax_invalid
+	t13_setmax_invalid \
+	t15_wakerace_to_fifo \
+	t14_unload_during_wait
 
 COMMON_OBJS = common.o
 
@@ -61,6 +63,12 @@ t12_root_uid_nomatch: t12_root_uid_nomatch.c $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 t13_setmax_invalid: t13_setmax_invalid.c $(COMMON_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+t15_wakerace_to_fifo: t15_wakerace_to_fifo.c $(COMMON_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+t14_unload_during_wait: t14_unload_during_wait.c $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 bench_uname: bench_uname.c

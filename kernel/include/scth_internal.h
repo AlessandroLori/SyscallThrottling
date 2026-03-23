@@ -10,6 +10,7 @@
 #include <linux/atomic.h>
 #include <linux/list.h>
 #include <linux/bitops.h>
+#include <linux/rcupdate.h>
 
 #include "scth_ioctl.h"
 
@@ -39,6 +40,8 @@ struct scth_uid_ent {
 };
 
 struct scth_cfg_store {
+    struct rcu_head rcu;
+
     struct hlist_head prog_ht[1 << SCTH_PROG_HT_BITS];
     struct hlist_head uid_ht[1 << SCTH_UID_HT_BITS];
 
@@ -81,9 +84,14 @@ struct scth_state {
 
     unsigned long sys_call_table_addr; /* da USCTM */
 
+    /* shutdown / unload coordination */
+    bool stopping;
+    atomic_t active_wrappers;
+    wait_queue_head_t unload_wq;
+
     /* config sets (prog/uid/sys) */
     struct mutex cfg_mutex;
-    struct scth_cfg_store cfg;
+    struct scth_cfg_store __rcu *cfg;
 
     /* FIFO_STRICT: coda globale waiters */
     struct list_head fifo_q;
@@ -128,8 +136,10 @@ int  scth_monitor_on(void);
 int  scth_monitor_off(void);
 
 /* cfg API */
-void scth_cfg_init(struct scth_cfg_store *c);
+struct scth_cfg_store *scth_cfg_alloc_empty(gfp_t gfp);
+struct scth_cfg_store *scth_cfg_clone(const struct scth_cfg_store *src, gfp_t gfp);
 void scth_cfg_destroy(struct scth_cfg_store *c);
+void scth_cfg_retire(struct scth_cfg_store *c);
 
 int  scth_cfg_add_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN]);
 int  scth_cfg_del_prog(struct scth_cfg_store *c, const char comm[SCTH_COMM_LEN]);

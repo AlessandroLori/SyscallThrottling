@@ -33,6 +33,8 @@ tests=(
   t11_nonroot_uid_match
   t12_root_uid_nomatch
   t13_setmax_invalid
+  t15_wakerace_to_fifo
+  t14_unload_during_wait
 )
 
 fails=0

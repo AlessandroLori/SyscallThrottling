@@ -41,6 +41,115 @@ static void scth_stats_reset_locked(void)
     atomic64_set(&g_scth.delay_num, 0);
 }
 
+static struct scth_cfg_store *scth_cfg_current_locked(void)
+{
+    return rcu_dereference_protected(g_scth.cfg,
+                                     lockdep_is_held(&g_scth.cfg_mutex));
+}
+
+static int scth_cfg_update_prog_locked(const char comm[SCTH_COMM_LEN], bool add)
+{
+    struct scth_cfg_store *old_cfg, *new_cfg;
+    int ret;
+
+    new_cfg = scth_cfg_clone(scth_cfg_current_locked(), GFP_KERNEL);
+    if (!new_cfg)
+        return -ENOMEM;
+
+    ret = add ? scth_cfg_add_prog(new_cfg, comm)
+              : scth_cfg_del_prog(new_cfg, comm);
+    if (ret) {
+        scth_cfg_destroy(new_cfg);
+        return ret;
+    }
+
+    old_cfg = scth_cfg_current_locked();
+    rcu_assign_pointer(g_scth.cfg, new_cfg);
+    scth_cfg_retire(old_cfg);
+    return 0;
+}
+
+static int scth_cfg_update_uid_locked(__u32 euid, bool add)
+{
+    struct scth_cfg_store *old_cfg, *new_cfg;
+    int ret;
+
+    new_cfg = scth_cfg_clone(scth_cfg_current_locked(), GFP_KERNEL);
+    if (!new_cfg)
+        return -ENOMEM;
+
+    ret = add ? scth_cfg_add_uid(new_cfg, euid)
+              : scth_cfg_del_uid(new_cfg, euid);
+    if (ret) {
+        scth_cfg_destroy(new_cfg);
+        return ret;
+    }
+
+    old_cfg = scth_cfg_current_locked();
+    rcu_assign_pointer(g_scth.cfg, new_cfg);
+    scth_cfg_retire(old_cfg);
+    return 0;
+}
+
+static int scth_cfg_update_sys_locked(__u32 nr, bool add)
+{
+    struct scth_cfg_store *old_cfg, *new_cfg;
+    int ret, hook_ret;
+
+    new_cfg = scth_cfg_clone(scth_cfg_current_locked(), GFP_KERNEL);
+    if (!new_cfg)
+        return -ENOMEM;
+
+    ret = add ? scth_cfg_add_sys(new_cfg, nr)
+              : scth_cfg_del_sys(new_cfg, nr);
+    if (ret) {
+        scth_cfg_destroy(new_cfg);
+        return ret;
+    }
+
+    if (add) {
+        /*
+         * ADD_SYS:
+         * installo hook prima di pubblicare la nuova snapshot.
+         * Finché non pubblico il nuovo sys_bitmap, il wrapper bypassa.
+         */
+        hook_ret = scth_hook_install(nr);
+        if (hook_ret) {
+            scth_cfg_destroy(new_cfg);
+            return hook_ret;
+        }
+
+        old_cfg = scth_cfg_current_locked();
+        rcu_assign_pointer(g_scth.cfg, new_cfg);
+        scth_cfg_retire(old_cfg);
+        return 0;
+    }
+
+    /*
+     * DEL_SYS:
+     * pubblico prima la snapshot senza la syscall,
+     * poi rimuovo l'hook.
+     * Nel transitorio il wrapper vede sys non registrata e bypassa.
+     */
+    old_cfg = scth_cfg_current_locked();
+    rcu_assign_pointer(g_scth.cfg, new_cfg);
+
+    hook_ret = scth_hook_remove(nr);
+    if (hook_ret) {
+        /*
+         * rollback publish:
+         * new_cfg può essere già stata vista da reader RCU, quindi NON va distrutta
+         * subito: va ritirata via call_rcu().
+         */
+        rcu_assign_pointer(g_scth.cfg, old_cfg);
+        scth_cfg_retire(new_cfg);
+        return hook_ret;
+    }
+
+    scth_cfg_retire(old_cfg);
+    return 0;
+}
+
 long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
 // Dispatcher centrale di ioctl, riceve comando e sceglie operaizone da eseguire
 {
@@ -166,7 +275,7 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
         if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-        ret = scth_cfg_add_prog(&g_scth.cfg, a.comm);
+        ret = scth_cfg_update_prog_locked(a.comm, true);
         mutex_unlock(&g_scth.cfg_mutex);
         return ret;
     }
@@ -178,16 +287,20 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
         if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-        ret = scth_cfg_del_prog(&g_scth.cfg, a.comm);
+        ret = scth_cfg_update_prog_locked(a.comm, false);
         mutex_unlock(&g_scth.cfg_mutex);
         return ret;
     }
 
     case SCTH_IOC_GET_PROG_COUNT: {
         __u32 cnt;
+        struct scth_cfg_store *cfg;
+
         mutex_lock(&g_scth.cfg_mutex);
-        cnt = scth_cfg_prog_count(&g_scth.cfg);
+        cfg = scth_cfg_current_locked();
+        cnt = cfg ? scth_cfg_prog_count(cfg) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
+
         if (copy_to_user((void __user *)arg, &cnt, sizeof(cnt))) return -EFAULT;
         return 0;
     }
@@ -195,12 +308,14 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
     case SCTH_IOC_GET_PROG_LIST: {
         struct scth_list_req req;
         struct scth_prog_arg *kbuf;
+        struct scth_cfg_store *cfg;
         __u32 needed, wrote;
 
         if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-        needed = scth_cfg_prog_count(&g_scth.cfg);
+        cfg = scth_cfg_current_locked();
+        needed = cfg ? scth_cfg_prog_count(cfg) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
 
         if (req.cap < needed) {
@@ -213,7 +328,8 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
         if (!kbuf) return -ENOMEM;
 
         mutex_lock(&g_scth.cfg_mutex);
-        wrote = scth_cfg_fill_prog_list(&g_scth.cfg, kbuf, needed);
+        cfg = scth_cfg_current_locked();
+        wrote = cfg ? scth_cfg_fill_prog_list(cfg, kbuf, needed) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
 
         req.count = wrote;
@@ -235,7 +351,7 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
         if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-        ret = scth_cfg_add_uid(&g_scth.cfg, a.euid);
+        ret = scth_cfg_update_uid_locked(a.euid, true);
         mutex_unlock(&g_scth.cfg_mutex);
         return ret;
     }
@@ -247,16 +363,20 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
         if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-        ret = scth_cfg_del_uid(&g_scth.cfg, a.euid);
+        ret = scth_cfg_update_uid_locked(a.euid, false);
         mutex_unlock(&g_scth.cfg_mutex);
         return ret;
     }
 
     case SCTH_IOC_GET_UID_COUNT: {
         __u32 cnt;
+        struct scth_cfg_store *cfg;
+
         mutex_lock(&g_scth.cfg_mutex);
-        cnt = scth_cfg_uid_count(&g_scth.cfg);
+        cfg = scth_cfg_current_locked();
+        cnt = cfg ? scth_cfg_uid_count(cfg) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
+
         if (copy_to_user((void __user *)arg, &cnt, sizeof(cnt))) return -EFAULT;
         return 0;
     }
@@ -264,12 +384,14 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
     case SCTH_IOC_GET_UID_LIST: {
         struct scth_list_req req;
         __u32 *kbuf;
+        struct scth_cfg_store *cfg;
         __u32 needed, wrote;
 
         if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-        needed = scth_cfg_uid_count(&g_scth.cfg);
+        cfg = scth_cfg_current_locked();
+        needed = cfg ? scth_cfg_uid_count(cfg) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
 
         if (req.cap < needed) {
@@ -282,7 +404,8 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
         if (!kbuf) return -ENOMEM;
 
         mutex_lock(&g_scth.cfg_mutex);
-        wrote = scth_cfg_fill_uid_list(&g_scth.cfg, kbuf, needed);
+        cfg = scth_cfg_current_locked();
+        wrote = cfg ? scth_cfg_fill_uid_list(cfg, kbuf, needed) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
 
         req.count = wrote;
@@ -299,61 +422,37 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
     /* ---- SYS ---- */
     case SCTH_IOC_ADD_SYS: {
         struct scth_sys_arg a;
-        int ret, hook_ret;
-
-        if (!scth_is_root())
-            return -EPERM;
-
-        if (copy_from_user(&a, (void __user *)arg, sizeof(a)))
-            return -EFAULT;
+        int ret;
+        if (!scth_is_root()) return -EPERM;
+        if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-
-        ret = scth_cfg_add_sys(&g_scth.cfg, a.nr);
-        if (ret == 0) {
-            hook_ret = scth_hook_install(a.nr);
-            if (hook_ret != 0) {
-                /* rollback: niente inserimento fantasma */
-                scth_cfg_del_sys(&g_scth.cfg, a.nr);
-                ret = hook_ret;
-            }
-        }
-
+        ret = scth_cfg_update_sys_locked(a.nr, true);
         mutex_unlock(&g_scth.cfg_mutex);
         return ret;
     }
 
     case SCTH_IOC_DEL_SYS: {
         struct scth_sys_arg a;
-        int ret, hook_ret;
-
-        if (!scth_is_root())
-            return -EPERM;
-
-        if (copy_from_user(&a, (void __user *)arg, sizeof(a)))
-            return -EFAULT;
+        int ret;
+        if (!scth_is_root()) return -EPERM;
+        if (copy_from_user(&a, (void __user *)arg, sizeof(a))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-
-        ret = scth_cfg_del_sys(&g_scth.cfg, a.nr);
-        if (ret == 0) {
-            hook_ret = scth_hook_remove(a.nr);
-            if (hook_ret != 0) {
-                /* rollback: se l’unhook fallisce, ripristino la config */
-                scth_cfg_add_sys(&g_scth.cfg, a.nr);
-                ret = hook_ret;
-            }
-        }
-
+        ret = scth_cfg_update_sys_locked(a.nr, false);
         mutex_unlock(&g_scth.cfg_mutex);
         return ret;
     }
 
     case SCTH_IOC_GET_SYS_COUNT: {
         __u32 cnt;
+        struct scth_cfg_store *cfg;
+
         mutex_lock(&g_scth.cfg_mutex);
-        cnt = scth_cfg_sys_count(&g_scth.cfg);
+        cfg = scth_cfg_current_locked();
+        cnt = cfg ? scth_cfg_sys_count(cfg) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
+
         if (copy_to_user((void __user *)arg, &cnt, sizeof(cnt))) return -EFAULT;
         return 0;
     }
@@ -361,12 +460,14 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
     case SCTH_IOC_GET_SYS_LIST: {
         struct scth_list_req req;
         __u32 *kbuf;
+        struct scth_cfg_store *cfg;
         __u32 needed, wrote;
 
         if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
 
         mutex_lock(&g_scth.cfg_mutex);
-        needed = scth_cfg_sys_count(&g_scth.cfg);
+        cfg = scth_cfg_current_locked();
+        needed = cfg ? scth_cfg_sys_count(cfg) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
 
         if (req.cap < needed) {
@@ -379,7 +480,8 @@ long scth_ioctl_dispatch(unsigned int cmd, unsigned long arg)
         if (!kbuf) return -ENOMEM;
 
         mutex_lock(&g_scth.cfg_mutex);
-        wrote = scth_cfg_fill_sys_list(&g_scth.cfg, kbuf, needed);
+        cfg = scth_cfg_current_locked();
+        wrote = cfg ? scth_cfg_fill_sys_list(cfg, kbuf, needed) : 0;
         mutex_unlock(&g_scth.cfg_mutex);
 
         req.count = wrote;

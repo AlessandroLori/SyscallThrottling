@@ -94,15 +94,23 @@ static __always_inline void scth_wp_on(struct scth_wp_ctx *ctx)
 }
 
 /* ---- cfg match: (prog OR uid) ---- */
-static bool scth_match_prog_or_uid(const char comm[SCTH_COMM_LEN], u32 euid)
-// Contorlla il matching su program names o userid ovvero controlla se il thread corrente deve essere sottoposto a throttling
+static bool scth_match_registered(u32 nr,
+                                  const char comm[SCTH_COMM_LEN],
+                                  u32 euid)
+// Controlla snapshot RCU corrente: syscall registrata AND (prog OR uid)
 {
-    bool match;
+    bool match = false;
+    struct scth_cfg_store *cfg;
 
-    mutex_lock(&g_scth.cfg_mutex);
-    match = scth_cfg_has_prog(&g_scth.cfg, comm) || scth_cfg_has_uid(&g_scth.cfg, euid);
-    mutex_unlock(&g_scth.cfg_mutex);
+    rcu_read_lock();
 
+    cfg = rcu_dereference(g_scth.cfg);
+    if (cfg &&
+        scth_cfg_has_sys(cfg, nr) &&
+        (scth_cfg_has_prog(cfg, comm) || scth_cfg_has_uid(cfg, euid)))
+        match = true;
+
+    rcu_read_unlock();
     return match;
 }
 
@@ -206,6 +214,37 @@ static __always_inline bool scth_try_take_token(void)
     }
 }
 
+static __always_inline void scth_fifo_enqueue_waiter_locked(struct scth_waiter *w)
+{
+    struct scth_waiter *pos;
+
+    list_for_each_entry(pos, &g_scth.fifo_q, node) {
+        if (w->ticket < pos->ticket) {
+            list_add_tail(&w->node, &pos->node);
+            goto inserted;
+        }
+    }
+
+    list_add_tail(&w->node, &g_scth.fifo_q);
+
+inserted:
+    g_scth.fifo_qlen++;
+    if (g_scth.fifo_qlen > g_scth.peak_fifo_qlen)
+        g_scth.peak_fifo_qlen = g_scth.fifo_qlen;
+}
+
+static __always_inline void scth_wrapper_enter(void)
+{
+    atomic_inc(&g_scth.active_wrappers);
+}
+
+static __always_inline void scth_wrapper_exit(void)
+{
+    if (atomic_dec_and_test(&g_scth.active_wrappers) &&
+        READ_ONCE(g_scth.stopping))
+        wake_up(&g_scth.unload_wq);
+}
+
 /* ---- wrapper M3: FIFO_STRICT vs WAKE_RACE ---- */
 static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 // Implementa sostituzione syscall in syscall table, bypass se monitor off, legge policy e la applica se FIFO o WAKE&RACE.
@@ -218,23 +257,32 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
     char comm[SCTH_COMM_LEN];
     u32 euid;
     u32 policy;
+    long rc;
 
     if (nr >= NR_syscalls)
         return -ENOSYS;
 
-    orig = READ_ONCE(scth_orig[nr]);
-    if (!orig)
-        return -ENOSYS;
+    scth_wrapper_enter();
 
-    if (!READ_ONCE(g_scth.monitor_on))
-        return orig(regs);
+    orig = READ_ONCE(scth_orig[nr]);
+    if (!orig) {
+        rc = -ENOSYS;
+        goto out;
+    }
+
+    if (READ_ONCE(g_scth.stopping) || !READ_ONCE(g_scth.monitor_on)) {
+        rc = orig(regs);
+        goto out;
+    }
 
     get_task_comm(comm, current);
     euid = (u32)from_kuid(&init_user_ns, current_euid());
 
-    /* se NON matcha (prog OR uid), bypass totale */
-    if (!scth_match_prog_or_uid(comm, euid))
-        return orig(regs);
+    /* se NON matcha config corrente (sys AND (prog OR uid)), bypass totale */
+    if (!scth_match_registered(nr, comm, euid)) {
+        rc = orig(regs);
+        goto out;
+    }
 
     /* questa syscall è davvero tracciata dal throttling */
     scth_stat_tracked();
@@ -251,14 +299,15 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
         /* token immediato => immediate */
         if (scth_try_take_token()) {
             scth_stat_immediate();
-            return orig(regs);
+            rc = orig(regs);
+            goto out;
         }
 
         /* devo aspettare: conta blocked */
         scth_blocked_inc();
         blocked_counted = true;
 
-        /* ticket solo per log/debug */
+        /* ticket usato anche per eventuale migrazione in FIFO */
         my_ticket = (u64)atomic64_inc_return(&g_scth.fifo_seq);
 
         for (;;) {
@@ -266,21 +315,116 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 
             ret = wait_event_interruptible(
                 g_scth.epoch_wq,
-                READ_ONCE(g_scth.epoch_id) != epoch0 || !READ_ONCE(g_scth.monitor_on)
+                READ_ONCE(g_scth.epoch_id) != epoch0 ||
+                !READ_ONCE(g_scth.monitor_on) ||
+                READ_ONCE(g_scth.stopping) ||
+                READ_ONCE(g_scth.policy_active) != SCTH_POLICY_WAKE_RACE
             );
 
             if (ret < 0) {
                 if (blocked_counted)
                     scth_blocked_dec();
                 scth_stat_aborted();
-                return -EINTR;
+                rc = -EINTR;
+                goto out;
             }
 
-            if (!READ_ONCE(g_scth.monitor_on)) {
+            if (READ_ONCE(g_scth.stopping) || !READ_ONCE(g_scth.monitor_on)) {
                 if (blocked_counted)
                     scth_blocked_dec();
                 scth_stat_aborted();
-                return orig(regs);
+                rc = orig(regs);
+                goto out;
+            }
+
+            /*
+             * Migrazione WAKE_RACE -> FIFO:
+             * il waiter si auto-inserisce nella fifo_q usando il ticket già assegnato,
+             * così preserviamo l'ordine temporale di arrivo.
+             */
+            if (READ_ONCE(g_scth.policy_active) == SCTH_POLICY_FIFO_STRICT) {
+                unsigned long flags;
+                long qret;
+                struct scth_waiter w;
+
+                INIT_LIST_HEAD(&w.node);
+                init_waitqueue_head(&w.wq);
+                w.granted = false;
+                w.aborted = false;
+                w.ticket = my_ticket;
+
+                spin_lock_irqsave(&g_scth.lock, flags);
+
+                if (!g_scth.monitor_on || g_scth.stopping) {
+                    spin_unlock_irqrestore(&g_scth.lock, flags);
+                    if (blocked_counted)
+                        scth_blocked_dec();
+                    scth_stat_aborted();
+                    rc = orig(regs);
+                    goto out;
+                }
+
+                /*
+                 * Se nel frattempo la policy è cambiata di nuovo, torno nel loop.
+                 */
+                if (g_scth.policy_active != SCTH_POLICY_FIFO_STRICT) {
+                    spin_unlock_irqrestore(&g_scth.lock, flags);
+                    epoch0 = READ_ONCE(g_scth.epoch_id);
+                    continue;
+                }
+
+                /*
+                 * Non incremento blocked: questo thread era già contato come blocked
+                 * quando stava aspettando in WAKE_RACE.
+                 */
+                scth_fifo_enqueue_waiter_locked(&w);
+                spin_unlock_irqrestore(&g_scth.lock, flags);
+
+                qret = wait_event_interruptible(
+                    w.wq,
+                    READ_ONCE(w.granted) ||
+                    READ_ONCE(w.aborted) ||
+                    !READ_ONCE(g_scth.monitor_on) ||
+                    READ_ONCE(g_scth.stopping)
+                );
+
+                if (blocked_counted)
+                    scth_blocked_dec();
+
+                if (qret < 0) {
+                    spin_lock_irqsave(&g_scth.lock, flags);
+                    if (!READ_ONCE(w.granted) && !READ_ONCE(w.aborted) && !list_empty(&w.node)) {
+                        list_del_init(&w.node);
+                        if (g_scth.fifo_qlen)
+                            g_scth.fifo_qlen--;
+                    }
+                    spin_unlock_irqrestore(&g_scth.lock, flags);
+
+                    scth_stat_aborted();
+                    rc = -EINTR;
+                    goto out;
+                }
+
+                if (READ_ONCE(g_scth.stopping) ||
+                    !READ_ONCE(g_scth.monitor_on) ||
+                    READ_ONCE(w.aborted)) {
+                    scth_stat_aborted();
+                    rc = orig(regs);
+                    goto out;
+                }
+
+                {
+                    u64 delay = ktime_get_ns() - t0;
+                    scth_stat_delayed(delay, comm, euid);
+
+                    pr_info_ratelimited("scthrottle: delayed nr=%u comm=%s euid=%u delay_ns=%llu ticket=%llu\n",
+                                        nr, comm, euid,
+                                        (unsigned long long)delay,
+                                        (unsigned long long)my_ticket);
+                }
+
+                rc = orig(regs);
+                goto out;
             }
 
             epoch0 = READ_ONCE(g_scth.epoch_id);
@@ -301,7 +445,8 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
                                 (unsigned long long)my_ticket);
         }
 
-        return orig(regs);
+        rc = orig(regs);
+        goto out;
     }
 
     /* ---------------- FIFO_STRICT (vera coda FIFO) ---------------- */
@@ -320,9 +465,10 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 
         spin_lock_irqsave(&g_scth.lock, flags);
 
-        if (!g_scth.monitor_on) {
+        if (!g_scth.monitor_on || g_scth.stopping) {
             spin_unlock_irqrestore(&g_scth.lock, flags);
-            return orig(regs);
+            rc = orig(regs);
+            goto out;
         }
 
         /*
@@ -337,11 +483,7 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             allowed_now = true;
         } else {
             w.ticket = (u64)atomic64_inc_return(&g_scth.fifo_seq);
-            list_add_tail(&w.node, &g_scth.fifo_q);
-
-            g_scth.fifo_qlen++;
-            if (g_scth.fifo_qlen > g_scth.peak_fifo_qlen)
-                g_scth.peak_fifo_qlen = g_scth.fifo_qlen;
+            scth_fifo_enqueue_waiter_locked(&w);
 
             scth_blocked_inc_locked();
             allowed_now = false;
@@ -351,13 +493,17 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 
         if (allowed_now) {
             scth_stat_immediate();
-            return orig(regs);
+            rc = orig(regs);
+            goto out;
         }
 
-        /* attesa fino a grant, oppure monitor_off, oppure abort/signal */
+        /* attesa fino a grant, oppure monitor_off/stopping, oppure abort/signal */
         ret = wait_event_interruptible(
             w.wq,
-            READ_ONCE(w.granted) || READ_ONCE(w.aborted) || !READ_ONCE(g_scth.monitor_on)
+            READ_ONCE(w.granted) ||
+            READ_ONCE(w.aborted) ||
+            !READ_ONCE(g_scth.monitor_on) ||
+            READ_ONCE(g_scth.stopping)
         );
 
         /* quando esco dall’attesa, non sono più blocked */
@@ -374,13 +520,17 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             spin_unlock_irqrestore(&g_scth.lock, flags);
 
             scth_stat_aborted();
-            return -EINTR;
+            rc = -EINTR;
+            goto out;
         }
 
-        /* monitor off o abort -> bypass immediato */
-        if (!READ_ONCE(g_scth.monitor_on) || READ_ONCE(w.aborted)) {
+        /* monitor off / stopping / abort -> bypass immediato */
+        if (READ_ONCE(g_scth.stopping) ||
+            !READ_ONCE(g_scth.monitor_on) ||
+            READ_ONCE(w.aborted)) {
             scth_stat_aborted();
-            return orig(regs);
+            rc = orig(regs);
+            goto out;
         }
 
         /* granted dopo attesa */
@@ -394,8 +544,13 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
                                 (unsigned long long)w.ticket);
         }
 
-        return orig(regs);
+        rc = orig(regs);
+        goto out;
     }
+
+out:
+    scth_wrapper_exit();
+    return rc;
 }
 
 int scth_hook_install(u32 nr)
