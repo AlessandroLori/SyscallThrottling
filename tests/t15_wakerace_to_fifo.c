@@ -123,13 +123,6 @@ int main(void)
              "delayed atteso > 0");
     T_ASSERT(st.peak_fifo_qlen > 0,
              "peak_fifo_qlen atteso > 0: i waiter WAKE_RACE dovrebbero migrare in FIFO");
-
-    /*
-     * Le stats sono globali al monitor: in suite potrebbe esserci uno straggler
-     * esterno/residuo che matcha "uname" e tiene current_fifo_qlen > 0 proprio
-     * nell'istante del campionamento. Faccio quindi quiesce esplicito prima
-     * dell'assert finale sulla coda corrente.
-     */
     T_CHECK_RC(scth_off());
     usleep(200000);
 

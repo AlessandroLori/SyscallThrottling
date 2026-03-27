@@ -39,7 +39,6 @@ static scth_sys_fn_t *scth_syscall_table(void)
 static scth_sys_fn_t scth_orig[NR_syscalls];
 static bool scth_hooked[NR_syscalls];
 
-/* ---- WP/CET safe patch context ---- */
 struct scth_wp_ctx {
     unsigned long cr0;
     unsigned long cr4;
@@ -93,7 +92,6 @@ static __always_inline void scth_wp_on(struct scth_wp_ctx *ctx)
     preempt_enable();
 }
 
-/* ---- cfg match: (prog OR uid) ---- */
 static bool scth_match_registered(u32 nr,
                                   const char comm[SCTH_COMM_LEN],
                                   u32 euid)
@@ -114,7 +112,6 @@ static bool scth_match_registered(u32 nr,
     return match;
 }
 
-/* ---- blocked helpers (per stats) ---- */
 static __always_inline void scth_blocked_inc_locked(void)
 // Incrementa il numero di thread bloccati e aumenta il picco di thread massimi bloccati se necessario
 
@@ -167,7 +164,6 @@ static __always_inline void scth_update_peak_delay(u64 delay_ns,
     spin_unlock_irqrestore(&g_scth.lock, flags);
 }
 
-/* ---- aggregate stats helpers ---- */
 static __always_inline void scth_stat_tracked(void)
 // Conta quante syscall sono entrate nel sistema di throttling (aspettando)
 {
@@ -197,7 +193,6 @@ static __always_inline void scth_stat_delayed(u64 delay_ns,
     scth_update_peak_delay(delay_ns, comm, euid);
 }
 
-/* ---- WAKE_RACE token acquire (per-epoch) ---- */
 static __always_inline bool scth_try_take_token(void)
 // Implementa la vera gara in WAKE&RACE in cui i thread eseguono cmpxchng per poter decrementare il numero di slot disponibili in epoca
 // e se ha successo ottiene lo slot di esecuzione per questa epoca
@@ -245,7 +240,6 @@ static __always_inline void scth_wrapper_exit(void)
         wake_up(&g_scth.unload_wq);
 }
 
-/* ---- wrapper M3: FIFO_STRICT vs WAKE_RACE ---- */
 static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 // Implementa sostituzione syscall in syscall table, bypass se monitor off, legge policy e la applica se FIFO o WAKE&RACE.
 // Punto in cui viene effettuata la distinzione tra bypass, immidiate, delayed e aborted.
@@ -284,7 +278,6 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
         goto out;
     }
 
-    /* questa syscall è davvero tracciata dal throttling */
     scth_stat_tracked();
 
     policy = READ_ONCE(g_scth.policy_active);
@@ -374,7 +367,7 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
                 }
 
                 /*
-                 * Non incremento blocked: questo thread era già contato come blocked
+                 * Non incremento blocked: thread era già contato come blocked
                  * quando stava aspettando in WAKE_RACE.
                  */
                 scth_fifo_enqueue_waiter_locked(&w);
@@ -449,7 +442,7 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
         goto out;
     }
 
-    /* ---------------- FIFO_STRICT (vera coda FIFO) ---------------- */
+    /* ---------------- FIFO_STRICT ---------------- */
     {
         unsigned long flags;
         bool allowed_now = false;
@@ -474,7 +467,7 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
         /*
          * FIFO STRICT:
          * - se coda vuota e ho budget in questa epoca -> passa subito
-         * - se coda NON vuota -> ti accodi (anche se c'è budget) per non scavalcare
+         * - se coda NON vuota -> ti accodi
          */
         if (g_scth.fifo_qlen == 0 && g_scth.epoch_used < g_scth.max_active) {
             g_scth.epoch_used++;
@@ -506,7 +499,6 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             READ_ONCE(g_scth.stopping)
         );
 
-        /* quando esco dall’attesa, non sono più blocked */
         scth_blocked_dec();
 
         /* signal: se ancora in coda, rimuovi e conta aborted */
@@ -533,7 +525,6 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             goto out;
         }
 
-        /* granted dopo attesa */
         {
             u64 delay = ktime_get_ns() - t0;
             scth_stat_delayed(delay, comm, euid);

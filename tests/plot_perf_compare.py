@@ -109,12 +109,6 @@ def svg_bar_chart(filename, title, ylabel, series_name):
 
         out.append(f'<text x="{cx}" y="{margin_top+plot_h+30}" text-anchor="middle" font-size="16">{p}</text>')
 
-#        vals = raw_vals[p]
-#        for j, rv in enumerate(vals):
-#            px = cx - 24 + j * 18
-#            py = ymap(rv)
-#            out.append(f'<circle cx="{px}" cy="{py}" r="5" fill="black"/>')
-
         out.append(f'<text x="{cx}" y="{y-10}" text-anchor="middle" font-size="13">mean={v:.2f}</text>')
 
     out.append('</svg>')
@@ -122,7 +116,6 @@ def svg_bar_chart(filename, title, ylabel, series_name):
     with open(filename, "w") as f:
         f.write("\n".join(out))
 
-# sempre disponibili
 svg_bar_chart("task_clock_compare.svg",
               "Confronto task-clock: FIFO vs WAKE_RACE",
               "Task clock (ms)",
@@ -133,7 +126,6 @@ svg_bar_chart("context_switches_compare.svg",
               "Context switches",
               "context_switches")
 
-# cycles solo se supportati
 has_cycles = any(r["cycles"] is not None for r in rows)
 if has_cycles:
     svg_bar_chart("cycles_compare.svg",

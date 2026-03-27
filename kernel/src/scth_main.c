@@ -88,7 +88,6 @@ static void scth_epoch_timer_fn(struct timer_list *t)
 
             g_scth.epoch_used++;
 
-            /* sveglio fuori lock */
             list_add_tail(&w->node, &to_wake);
         }
 
@@ -140,7 +139,6 @@ int scth_monitor_on(void)
             atomic_set(&g_scth.epoch_tokens, (int)g_scth.max_active);
             wake_race = true;
         } else {
-            /* FIFO: non concedo qui, concede il wrapper (IMM) o il timer (Q) */
         }
 
         mod_timer(&g_scth.epoch_timer, jiffies + HZ);
@@ -233,7 +231,6 @@ static int __init scth_init(void)
         rcu_assign_pointer(g_scth.cfg, cfg0);
     }
 
-    /* default */
     g_scth.monitor_on = false;
     g_scth.max_pending = 5;
     g_scth.max_active  = 0;
@@ -311,7 +308,7 @@ static void __exit scth_exit(void)
     scth_cfg_destroy(cfg);
 
     /*
-     * Importante: drena eventuali call_rcu() pendenti generate da vecchi update
+     * Drena eventuali call_rcu() pendenti generate da vecchi update
      * della config, così nessun callback del modulo resta in coda dopo l'unload.
      */
     rcu_barrier();

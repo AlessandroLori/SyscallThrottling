@@ -16,7 +16,7 @@
 
 #define SCTH_DEV_NAME "scthrottle"
 
-/* NR_syscalls (fallback se non definito) */
+/* NR_syscalls  */
 #include <asm/unistd.h>
 #ifndef NR_syscalls
 #define NR_syscalls 1024
@@ -67,14 +67,14 @@ struct scth_state {
 
     bool monitor_on;
 
-    __u32 max_active;     /* budget effettivo per epoca (attivo) */
-    __u32 max_pending;    /* configurato via setmax (pending) */
+    __u32 max_active;     /* budget effettivo per epoca  */
+    __u32 max_pending;    /* configurato in next epoch */
 
     __u8  policy_active;
     __u8  policy_pending;
 
     __u64 epoch_id;
-    __u32 epoch_used;     /* quanti “slot” già consumati in questa epoca (FIFO strict) */
+    __u32 epoch_used;     /* quanti “slot” già consumati in questa epoca */
 
     /* WAKE_RACE: token per epoca */
     atomic_t epoch_tokens;

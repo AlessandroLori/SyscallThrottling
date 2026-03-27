@@ -1,10 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Syscall Throttling - shared IOCTL ABI (kernel <-> user)
- *
- * Header "compat-friendly": espone sia nomi "nuovi" sia "vecchi"
- * per evitare mismatch kernel/user.
- */
 #ifndef SCTH_IOCTL_H
 #define SCTH_IOCTL_H
 
@@ -23,7 +16,7 @@
 #define SCTH_POLICY_FIFO_STRICT 0
 #define SCTH_POLICY_WAKE_RACE   1
 
-/* ---- Struct ABI (canonical) ---- */
+/* ---- Struct ABI  ---- */
 
 struct scth_cfg {
     __u32 abi_version;
@@ -47,7 +40,7 @@ struct scth_prog_arg { char comm[SCTH_COMM_LEN]; };
 struct scth_uid_arg  { __u32 euid; };
 struct scth_sys_arg  { __u32 nr; };
 
-/* Stats (può crescere; campi extra possono essere 0 se non implementati nel kernel) */
+/* Stats */
 struct scth_stats {
     __u32 abi_version;
 
@@ -59,7 +52,6 @@ struct scth_stats {
     __u64 blocked_sum;
     __u64 blocked_samples;
 
-    /* extra opzionali */
     __u64 delay_sum_ns;
     __u64 delay_num;
 
@@ -78,7 +70,7 @@ struct scth_stats {
     __u32 policy_pending;
 };
 
-/* ---- IOCTLs (canonical) ---- */
+/* ---- IOCTLs ---- */
 #define SCTH_IOC_MAGIC        's'
 
 #define SCTH_IOC_ON           _IO(SCTH_IOC_MAGIC, 0x01)
@@ -104,7 +96,7 @@ struct scth_stats {
 #define SCTH_IOC_GET_SYS_COUNT _IOR(SCTH_IOC_MAGIC, 0x32, __u32)
 #define SCTH_IOC_GET_SYS_LIST  _IOWR(SCTH_IOC_MAGIC, 0x33, struct scth_list_req)
 
-/* ---- Alias compat (vecchi nomi) ---- */
+/* ---- Alias compat ---- */
 #define SCTH_IOC_MONITOR_ON   SCTH_IOC_ON
 #define SCTH_IOC_MONITOR_OFF  SCTH_IOC_OFF
 
@@ -126,7 +118,6 @@ struct scth_stats {
 #define SCTH_IOC_LIST_UID     SCTH_IOC_GET_UID_LIST
 #define SCTH_IOC_LIST_SYS     SCTH_IOC_GET_SYS_LIST
 
-/* alias campi usati in alcune versioni user */
 #define peak_prog     peak_comm
 #define peak_uid      peak_euid
 #define capacity_elems capacity
@@ -134,7 +125,6 @@ struct scth_stats {
 #define out_count      count
 #define user_buf       user_ptr
 
-/* struct opzionali (alcune versioni user li usano) */
 struct scth_max_req    { __u32 max_per_sec; };
 struct scth_policy_req { __u8  policy; };
 struct scth_uid_req    { __u32 euid; };
@@ -143,7 +133,7 @@ struct scth_comm_req   { char  comm[SCTH_COMM_LEN]; };
 
 #define max_per_epoch max_per_sec
 
-/* ---- Alias compat (vecchi nomi usati da parti del progetto) ---- */
+/* ---- Alias compat---- */
 #define abi abi_version
 
 #define peak_prog peak_comm
@@ -175,31 +165,5 @@ struct scth_comm_req   { char  comm[SCTH_COMM_LEN]; };
 #define SCTH_IOC_LIST_PROG   SCTH_IOC_GET_PROG_LIST
 #define SCTH_IOC_LIST_UID    SCTH_IOC_GET_UID_LIST
 #define SCTH_IOC_LIST_SYS    SCTH_IOC_GET_SYS_LIST
-
-/*
-struct scth_u32_arg {
-    __u32 v;
-};
-
-struct scth_comm_arg {
-    char comm[SCTH_COMM_LEN];
-};
-
-struct scth_uid_req {
-    __u32 euid;
-};
-
-struct scth_sys_req {
-    __u32 nr;
-};
-
-struct scth_max_req {
-    __u32 max_per_sec;
-};
-
-struct scth_policy_req {
-    __u8 policy;
-};
-*/
 
 #endif /* SCTH_IOCTL_H */
