@@ -116,19 +116,19 @@ def svg_bar_chart(filename, title, ylabel, series_name):
     with open(filename, "w") as f:
         f.write("\n".join(out))
 
-svg_bar_chart("task_clock_compare.svg",
+svg_bar_chart("task_clock_compare2.svg",
               "Confronto task-clock: FIFO vs WAKE_RACE",
               "Task clock (ms)",
               "task_clock_ms")
 
-svg_bar_chart("context_switches_compare.svg",
+svg_bar_chart("context_switches_compare2.svg",
               "Confronto context-switches: FIFO vs WAKE_RACE",
               "Context switches",
               "context_switches")
 
 has_cycles = any(r["cycles"] is not None for r in rows)
 if has_cycles:
-    svg_bar_chart("cycles_compare.svg",
+    svg_bar_chart("cycles_compare2.svg",
                   "Confronto cycles: FIFO vs WAKE_RACE",
                   "Cycles",
                   "cycles")

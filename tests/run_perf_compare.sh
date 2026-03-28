@@ -3,9 +3,10 @@ set -euo pipefail
 export LC_ALL=C
 
 THREADS="${THREADS:-300}"
-CALLS="${CALLS:-10}"
-MAXTOK="${MAXTOK:-200}"
+CALLS="${CALLS:-3}"
+MAXTOK="${MAXTOK:-20}"
 RUNS="${RUNS:-1}"
+PERF_SEP=';'
 
 OUTCSV="${OUTCSV:-perf_compare.csv}"
 BENCH="./bench_uname"
@@ -50,16 +51,61 @@ setup_policy() {
   sudo ./../user/scthctl addprog bench_uname
 }
 
-perf_extract() {
+perf_extract_value() {
   local file="$1"
   local event="$2"
 
-  sudo awk -F, -v ev="$event" '
+  sudo awk -F"$PERF_SEP" -v ev="$event" '
     $3 == ev {
       gsub(/[[:space:]]/, "", $1);
       print $1;
     }
   ' "$file" | tail -n1
+}
+
+perf_extract_unit() {
+  local file="$1"
+  local event="$2"
+
+  sudo awk -F"$PERF_SEP" -v ev="$event" '
+    $3 == ev {
+      gsub(/[[:space:]]/, "", $2);
+      print $2;
+    }
+  ' "$file" | tail -n1
+}
+
+to_msec() {
+  local event="${1:-}"
+  local value="${2:-}"
+  local unit="${3:-}"
+
+  if [[ -z "$value" ]]; then
+    echo ""
+    return
+  fi
+
+  case "$event:$unit" in
+    task-clock:"")
+      # Su questa build di perf, task-clock esce senza unità ma il valore è in ns.
+      awk -v x="$value" 'BEGIN { printf "%.3f\n", x / 1000000.0 }'
+      ;;
+    *:msec|*:ms)
+      awk -v x="$value" 'BEGIN { printf "%.3f\n", x }'
+      ;;
+    *:usec|*:us)
+      awk -v x="$value" 'BEGIN { printf "%.3f\n", x / 1000.0 }'
+      ;;
+    *:nsec|*:ns)
+      awk -v x="$value" 'BEGIN { printf "%.3f\n", x / 1000000.0 }'
+      ;;
+    *:sec|*:s)
+      awk -v x="$value" 'BEGIN { printf "%.3f\n", x * 1000.0 }'
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
 }
 
 normalize_metric() {
@@ -93,25 +139,32 @@ run_one() {
   setup_policy "$policy_num"
 
   sudo perf stat \
-    -x, \
+    --no-big-num \
+    -x "$PERF_SEP" \
     -e cycles,task-clock,context-switches \
     -o "$perf_out" \
     -- "$BENCH" "$THREADS" "$CALLS"
 
   local cycles_raw
   local task_clock_raw
+  local task_clock_unit
   local csw_raw
 
-  cycles_raw="$(perf_extract "$perf_out" "cycles")"
-  task_clock_raw="$(perf_extract "$perf_out" "task-clock")"
-  csw_raw="$(perf_extract "$perf_out" "context-switches")"
+  echo "=== RAW PERF OUTPUT ($policy_name run $run_id) ===" 
+  sudo cat "$perf_out"
+  echo "==============================================="
+
+  cycles_raw="$(perf_extract_value "$perf_out" "cycles")"
+  task_clock_raw="$(perf_extract_value "$perf_out" "task-clock")"
+  task_clock_unit="$(perf_extract_unit "$perf_out" "task-clock")"
+  csw_raw="$(perf_extract_value "$perf_out" "context-switches")"
 
   local cycles
   local task_clock
   local csw
 
   cycles="$(normalize_metric "$cycles_raw")"
-  task_clock="$(normalize_metric "$task_clock_raw")"
+  task_clock="$(normalize_metric "$(to_msec "task-clock" "$task_clock_raw" "$task_clock_unit")")"
   csw="$(normalize_metric "$csw_raw")"
 
   if [[ -z "$task_clock" || -z "$csw" ]]; then
