@@ -211,22 +211,55 @@ static __always_inline bool scth_try_take_token(void)
 
 static __always_inline void scth_fifo_enqueue_waiter_locked(struct scth_waiter *w)
 {
-    struct scth_waiter *pos;
-
-    list_for_each_entry(pos, &g_scth.fifo_q, node) {
-        if (w->ticket < pos->ticket) {
-            list_add_tail(&w->node, &pos->node);
-            goto inserted;
-        }
-    }
-
     list_add_tail(&w->node, &g_scth.fifo_q);
-
-inserted:
     g_scth.fifo_qlen++;
+
     if (g_scth.fifo_qlen > g_scth.peak_fifo_qlen)
         g_scth.peak_fifo_qlen = g_scth.fifo_qlen;
 }
+
+static __always_inline void scth_wr_enqueue_waiter_locked(struct scth_waiter *w)
+{
+    list_add_tail(&w->node, &g_scth.wr_q);
+    g_scth.wr_qlen++;
+}
+
+/*
+ * Helper usato nei path rari (signal / shutdown) per rimuovere un waiter
+ * da qualunque coda stia ancora occupando.
+ * La scansione O(n) qui è accettabile perché non è nel path di migrazione
+ * né nel fast path normale; il miglioramento richiesto riguarda la migrazione
+ * WR -> FIFO, che ora è O(1).
+ */
+static __always_inline void scth_remove_waiter_from_any_q_locked(struct scth_waiter *w)
+{
+    struct scth_waiter *pos;
+
+    if (list_empty(&w->node))
+        return;
+
+    list_for_each_entry(pos, &g_scth.wr_q, node) {
+        if (pos == w) {
+            list_del_init(&w->node);
+            if (g_scth.wr_qlen)
+                g_scth.wr_qlen--;
+            return;
+        }
+    }
+
+    list_for_each_entry(pos, &g_scth.fifo_q, node) {
+        if (pos == w) {
+            list_del_init(&w->node);
+            if (g_scth.fifo_qlen)
+                g_scth.fifo_qlen--;
+            return;
+        }
+    }
+
+    list_del_init(&w->node);
+}
+
+
 
 static __always_inline void scth_wrapper_enter(void)
 {
@@ -245,6 +278,8 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
 // Punto in cui viene effettuata la distinzione tra bypass, immidiate, delayed e aborted.
 // Possiede logica FIFO e gestione della coda, risvegli e bypass
 // Possiede logica WAKE&RACE e gestione del risveglio di tutti e di disponibilità slot (token) per epoca
+// Le code sono wait_interruptable perché se un thread è colpito da un segnale idoneo con l'interruzione viene tornato -EINTR alla syscall
+//  e il thread flaggato come aborted
 {
     u32 nr = (u32)regs->orig_ax;
     scth_sys_fn_t orig;
@@ -283,11 +318,19 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
     policy = READ_ONCE(g_scth.policy_active);
 
     /* ---------------- WAKE_RACE ---------------- */
+    /* ---------------- WAKE_RACE ---------------- */
     if (policy == SCTH_POLICY_WAKE_RACE) {
+        unsigned long flags;
         u64 t0 = ktime_get_ns();
-        u64 epoch0 = READ_ONCE(g_scth.epoch_id);
+        u64 epoch0;
         bool blocked_counted = false;
-        u64 my_ticket = 0;
+        struct scth_waiter w;
+
+        INIT_LIST_HEAD(&w.node);
+        init_waitqueue_head(&w.wq);
+        w.granted = false;
+        w.aborted = false;
+        w.ticket = 0;
 
         /* token immediato => immediate */
         if (scth_try_take_token()) {
@@ -296,115 +339,116 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             goto out;
         }
 
-        /* devo aspettare: conta blocked */
-        scth_blocked_inc();
+        /*
+         * Da questo punto il thread diventa waiter WAKE_RACE:
+         * lo accodiamo in wr_q in O(1) e lo contiamo come blocked.
+         */
+        spin_lock_irqsave(&g_scth.lock, flags);
+
+        if (!g_scth.monitor_on || g_scth.stopping) {
+            spin_unlock_irqrestore(&g_scth.lock, flags);
+            rc = orig(regs);
+            goto out;
+        }
+
+        w.ticket = (u64)atomic64_inc_return(&g_scth.fifo_seq);
+        scth_wr_enqueue_waiter_locked(&w);
+        scth_blocked_inc_locked();
         blocked_counted = true;
 
-        /* ticket usato anche per eventuale migrazione in FIFO */
-        my_ticket = (u64)atomic64_inc_return(&g_scth.fifo_seq);
+        spin_unlock_irqrestore(&g_scth.lock, flags);
 
         for (;;) {
             long ret;
+
+            epoch0 = READ_ONCE(g_scth.epoch_id);
 
             ret = wait_event_interruptible(
                 g_scth.epoch_wq,
                 READ_ONCE(g_scth.epoch_id) != epoch0 ||
                 !READ_ONCE(g_scth.monitor_on) ||
                 READ_ONCE(g_scth.stopping) ||
-                READ_ONCE(g_scth.policy_active) != SCTH_POLICY_WAKE_RACE
+                READ_ONCE(g_scth.policy_active) != SCTH_POLICY_WAKE_RACE ||
+                READ_ONCE(w.granted) ||
+                READ_ONCE(w.aborted)
             );
 
             if (ret < 0) {
+                spin_lock_irqsave(&g_scth.lock, flags);
+                scth_remove_waiter_from_any_q_locked(&w);
+                spin_unlock_irqrestore(&g_scth.lock, flags);
+
                 if (blocked_counted)
                     scth_blocked_dec();
+
                 scth_stat_aborted();
                 rc = -EINTR;
                 goto out;
             }
 
-            if (READ_ONCE(g_scth.stopping) || !READ_ONCE(g_scth.monitor_on)) {
+            if (READ_ONCE(g_scth.stopping) ||
+                !READ_ONCE(g_scth.monitor_on) ||
+                READ_ONCE(w.aborted)) {
+                spin_lock_irqsave(&g_scth.lock, flags);
+                scth_remove_waiter_from_any_q_locked(&w);
+                spin_unlock_irqrestore(&g_scth.lock, flags);
+
                 if (blocked_counted)
                     scth_blocked_dec();
+
                 scth_stat_aborted();
                 rc = orig(regs);
                 goto out;
             }
 
             /*
-             * Migrazione WAKE_RACE -> FIFO:
-             * il waiter si auto-inserisce nella fifo_q usando il ticket già assegnato,
-             * così preserviamo l'ordine temporale di arrivo.
+             * Cambio policy WAKE_RACE -> FIFO:
+             * il waiter NON si reinserisce più uno per uno.
+             * È già stato migrato in O(1) dal timer tramite splice wr_q -> fifo_q.
              */
             if (READ_ONCE(g_scth.policy_active) == SCTH_POLICY_FIFO_STRICT) {
-                unsigned long flags;
                 long qret;
-                struct scth_waiter w;
-
-                INIT_LIST_HEAD(&w.node);
-                init_waitqueue_head(&w.wq);
-                w.granted = false;
-                w.aborted = false;
-                w.ticket = my_ticket;
-
-                spin_lock_irqsave(&g_scth.lock, flags);
-
-                if (!g_scth.monitor_on || g_scth.stopping) {
-                    spin_unlock_irqrestore(&g_scth.lock, flags);
-                    if (blocked_counted)
-                        scth_blocked_dec();
-                    scth_stat_aborted();
-                    rc = orig(regs);
-                    goto out;
-                }
 
                 /*
-                 * Se nel frattempo la policy è cambiata di nuovo, torno nel loop.
+                 * Se il timer lo aveva già promoted mentre era ancora in wait su epoch_wq,
+                 * granted è già visibile e può procedere subito.
                  */
-                if (g_scth.policy_active != SCTH_POLICY_FIFO_STRICT) {
-                    spin_unlock_irqrestore(&g_scth.lock, flags);
-                    epoch0 = READ_ONCE(g_scth.epoch_id);
-                    continue;
+                if (!READ_ONCE(w.granted)) {
+                    qret = wait_event_interruptible(
+                        w.wq,
+                        READ_ONCE(w.granted) ||
+                        READ_ONCE(w.aborted) ||
+                        !READ_ONCE(g_scth.monitor_on) ||
+                        READ_ONCE(g_scth.stopping)
+                    );
+
+                    if (qret < 0) {
+                        spin_lock_irqsave(&g_scth.lock, flags);
+                        scth_remove_waiter_from_any_q_locked(&w);
+                        spin_unlock_irqrestore(&g_scth.lock, flags);
+
+                        if (blocked_counted)
+                            scth_blocked_dec();
+
+                        scth_stat_aborted();
+                        rc = -EINTR;
+                        goto out;
+                    }
+
+                    if (READ_ONCE(g_scth.stopping) ||
+                        !READ_ONCE(g_scth.monitor_on) ||
+                        READ_ONCE(w.aborted)) {
+                        if (blocked_counted)
+                            scth_blocked_dec();
+
+                        scth_stat_aborted();
+                        rc = orig(regs);
+                        goto out;
+                    }
                 }
-
-                /*
-                 * Non incremento blocked: thread era già contato come blocked
-                 * quando stava aspettando in WAKE_RACE.
-                 */
-                scth_fifo_enqueue_waiter_locked(&w);
-                spin_unlock_irqrestore(&g_scth.lock, flags);
-
-                qret = wait_event_interruptible(
-                    w.wq,
-                    READ_ONCE(w.granted) ||
-                    READ_ONCE(w.aborted) ||
-                    !READ_ONCE(g_scth.monitor_on) ||
-                    READ_ONCE(g_scth.stopping)
-                );
 
                 if (blocked_counted)
                     scth_blocked_dec();
-
-                if (qret < 0) {
-                    spin_lock_irqsave(&g_scth.lock, flags);
-                    if (!READ_ONCE(w.granted) && !READ_ONCE(w.aborted) && !list_empty(&w.node)) {
-                        list_del_init(&w.node);
-                        if (g_scth.fifo_qlen)
-                            g_scth.fifo_qlen--;
-                    }
-                    spin_unlock_irqrestore(&g_scth.lock, flags);
-
-                    scth_stat_aborted();
-                    rc = -EINTR;
-                    goto out;
-                }
-
-                if (READ_ONCE(g_scth.stopping) ||
-                    !READ_ONCE(g_scth.monitor_on) ||
-                    READ_ONCE(w.aborted)) {
-                    scth_stat_aborted();
-                    rc = orig(regs);
-                    goto out;
-                }
 
                 {
                     u64 delay = ktime_get_ns() - t0;
@@ -413,16 +457,25 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
                     pr_info_ratelimited("scthrottle: delayed nr=%u comm=%s euid=%u delay_ns=%llu ticket=%llu\n",
                                         nr, comm, euid,
                                         (unsigned long long)delay,
-                                        (unsigned long long)my_ticket);
+                                        (unsigned long long)w.ticket);
                 }
 
                 rc = orig(regs);
                 goto out;
             }
 
-            epoch0 = READ_ONCE(g_scth.epoch_id);
-            if (scth_try_take_token())
+            /* Ancora in WAKE_RACE: provo a prendere un token della nuova epoca. */
+            if (scth_try_take_token()) {
+                spin_lock_irqsave(&g_scth.lock, flags);
+                if (!list_empty(&w.node)) {
+                    list_del_init(&w.node);
+                    if (g_scth.wr_qlen)
+                        g_scth.wr_qlen--;
+                }
+                spin_unlock_irqrestore(&g_scth.lock, flags);
+
                 break;
+            }
         }
 
         if (blocked_counted)
@@ -435,20 +488,20 @@ static asmlinkage long scth_syscall_wrapper(const struct pt_regs *regs)
             pr_info_ratelimited("scthrottle: delayed nr=%u comm=%s euid=%u delay_ns=%llu ticket=%llu\n",
                                 nr, comm, euid,
                                 (unsigned long long)delay,
-                                (unsigned long long)my_ticket);
+                                (unsigned long long)w.ticket);
         }
 
         rc = orig(regs);
         goto out;
     }
-
+    
     /* ---------------- FIFO_STRICT ---------------- */
     {
         unsigned long flags;
         bool allowed_now = false;
         long ret;
         u64 t0 = ktime_get_ns();
-        struct scth_waiter w;
+        struct scth_waiter w;   //allocata come variabile locale del thread quindi non nell'heap del kernel
 
         INIT_LIST_HEAD(&w.node);
         init_waitqueue_head(&w.wq);

@@ -76,9 +76,13 @@ struct scth_state {
     __u64 epoch_id;
     __u32 epoch_used;     /* quanti “slot” già consumati in questa epoca */
 
-    /* WAKE_RACE: token per epoca */
+    /* WAKE_RACE: token per epoca + coda waiters */
     atomic_t epoch_tokens;
     wait_queue_head_t epoch_wq;
+
+    /* waiters bloccati in WAKE_RACE, mantenuti in ordine di arrivo */
+    struct list_head wr_q;
+    __u32 wr_qlen;
 
     struct timer_list epoch_timer;
 

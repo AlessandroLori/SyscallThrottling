@@ -58,11 +58,24 @@ static void scth_epoch_timer_fn(struct timer_list *t)
     g_scth.blocked_num_samples++;
 
     /*
-     * Se passiamo da WAKE_RACE a FIFO, devo svegliare i waiter su epoch_wq
-     * affinché si auto-migrino nella fifo_q.
+     * WAKE_RACE -> FIFO:
+     * invece di far auto-migrare i thread uno per uno (O(n) complessivo),
+     * trasferiamo l'intera coda WR nella FIFO in O(1) con list_splice_tail_init().
+     * Poi svegliamo i waiter su epoch_wq così possano osservare il cambio policy:
+     * - se già granted, proseguono subito
+     * - altrimenti inizieranno ad aspettare sulla loro wq privata
      */
     if (old_policy == SCTH_POLICY_WAKE_RACE &&
         g_scth.policy_active == SCTH_POLICY_FIFO_STRICT) {
+
+        if (!list_empty(&g_scth.wr_q)) {
+            list_splice_tail_init(&g_scth.wr_q, &g_scth.fifo_q);
+            g_scth.fifo_qlen += g_scth.wr_qlen;
+            if (g_scth.fifo_qlen > g_scth.peak_fifo_qlen)
+                g_scth.peak_fifo_qlen = g_scth.fifo_qlen;
+            g_scth.wr_qlen = 0;
+        }
+
         wake_epoch_waiters = true;
     }
 
@@ -177,6 +190,17 @@ int scth_monitor_off(void)
     }
     g_scth.fifo_qlen = 0;
 
+    /*
+     * WAKE_RACE: rimuove tutti i waiter dalla coda WR e li marca aborted.
+     * Verranno svegliati dal wake_up_all(epoch_wq) più sotto.
+     */
+    while (!list_empty(&g_scth.wr_q)) {
+        struct scth_waiter *w = list_first_entry(&g_scth.wr_q, struct scth_waiter, node);
+        list_del_init(&w->node);
+        w->aborted = true;
+    }
+    g_scth.wr_qlen = 0;
+
     spin_unlock_irqrestore(&g_scth.lock, flags);
 
     /* sveglia chi aspetta cambio epoca */
@@ -221,6 +245,10 @@ static int __init scth_init(void)
 
     INIT_LIST_HEAD(&g_scth.fifo_q);
     g_scth.fifo_qlen = 0;
+
+    INIT_LIST_HEAD(&g_scth.wr_q);
+    g_scth.wr_qlen = 0;
+
     atomic64_set(&g_scth.fifo_seq, 0);
 
     {
